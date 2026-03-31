@@ -1,7 +1,23 @@
-# AdaR Self-Play 实现文档
+### 原版AdaR
 
-日期: 2026-03-30
-对应计划: `TODO0330.md`
+在原版AdaR框架下, 一个外部的大模型(72B)负责合成变体问题数据. 具体来说, 这个合成变体问题的过程分为以下步骤:
+1. 生成题目模板和解题代码
+2. 一个自动算法检查正确性, 包括变量是否一致, 程序是否可以执行, 执行结果是否与答案一致
+3. 一个自动算法对题目施加扰动,产生变体问题
+4. 大模型回答这些变体问题, 只要多个(n=5)结果中有和解题代码结果一致的, 就认为这个扰动是可以接受的
+5. 大模型对通过的变体问题进行paraphrase
+6. 收集数据, 用于训练内部的小模型
+
+### Self-Play版
+
+现在把外部的大模型(72B)替换为本地的小模型(~3B), 并且参与训练.
+1. 给定一个问题, 模型提取模板和解题代码, rollout n_1 次, 此次的输入输出记为 T1[In_1,Out_1]
+2. 自动校验
+3. 自动扰动, rollout n_2次.
+4. 对扰动后的变体问题, 让本地小模型尝试解答, rollout n_3 次, 此次的输入输出记为 T2[In_2, Out_2], 只要有和代码运行结果一致的, 就接受该扰动
+5. 对通过的扰动做paraphrase, rollout n_4 次, 此次的输入输出记为 T3[In_3,Out_3]
+6. 小模型尝试对paraphrase的问题进行回答, rollout n_5 次, 此次输入输出记为 T4[In_4,Out_4]
+7. 计算reward, 记第6步某道题的正确率为acc, T4的reward= 1 if correct else 0, T3的reward=1-4*sqr(acc-0.5), 表示paraphrase适当的有点挑战性比较好. T2 的reward= 1 if correct else 0 , 但是如果不存在和代码运行一致的解答, 则舍弃这个批次, 不计算loss, 并且认为第一步的结果有误. T1的reward=1 if 步骤2,3,4均通过 else 0. 4个loss 都按照grpo的方式计算, token-mean-group-mean. 最后的总loss为4个loss带权相加, 权作为参数可设置.
 
 ## 概述
 
@@ -18,25 +34,27 @@
 | 文件 | 说明 |
 |------|------|
 | `__init__.py` | 包初始化 |
-| `auto_pipeline.py` | 核心pipeline逻辑，从AdaR/scripts重构而来 |
+| `auto_pipeline.py` | 核心pipeline逻辑，从scripts/adar重构而来 |
 | `prompt_builder.py` | 各阶段prompt构造 + DataProto编码 |
 | `adar_selfplay_reward.py` | 4阶段reward计算函数 |
 | `adar_selfplay_ray_trainer.py` | 自定义trainer，继承RayPPOTrainer |
 | `run_adar_selfplay.py` | Hydra入口脚本 |
 | `config/adar_selfplay_trainer.yaml` | Hydra配置文件 |
 
-### AdaR/scripts/ (AdaR项目侧, 2个新文件)
+### scripts/adar/ (训练脚本侧, 2个新文件)
 
 | 文件 | 说明 |
 |------|------|
 | `prepare_selfplay_data.py` | 将原始JSON数据转换为verl parquet格式 |
 | `test_adar_selfplay_0.5b_20260330.sh` | T4-only模式测试脚本 (已通过) |
+| `test_adar_selfplay_full_0.5b_20260330.sh` | 0.5B完整测试 (已通过) |
+| `test_adar_selfplay_qwen3_4b_20260330.sh` | Qwen3-4B完整测试(已通过) |
 
 ## 各文件详细说明
 
 ### 1. `auto_pipeline.py` — 核心pipeline逻辑
 
-从`AdaR/scripts/`中的以下脚本重构提取:
+从`scripts/adar/`中的以下脚本重构提取:
 - `auto_pipeline.py` → `SafeExecutor`, `parse_and_verify()`, `randomize_value()`, `randomize_code_once()`
 - `check_evs.py` → `check_evs()`, `compute_evs_accuracy()`
 - `extract_utils.py` → `extract_last_num()`, `extract_last_number_from_solution()`
@@ -115,39 +133,3 @@
 
 本次实现完全基于增量新增文件，未修改verl框架或AdaR项目中的任何现有文件。
 
-## 测试结果
-
-### T4-only模式 (标准GRPO)
-- 服务器: A6000-4, GPU 4,5
-- 模型: Qwen2.5-0.5B-Instruct
-- 配置: batch_size=16, max_prompt/response_length=128, n=4
-- 结果: 成功完成11个training steps，checkpoint保存正常
-- 脚本: `test_adar_selfplay_0.5b_20260330.sh` (已标记TESTED: YES)
-
-### 完整Self-Play模式
-- 服务器: A6000-4, GPU 0,1
-- 模型: Qwen2.5-0.5B-Instruct
-- 配置: batch_size=8, max_prompt/response_length=256, n1=n2=n3=n4=n5=2
-- 结果: 成功完成24个training steps，checkpoint保存正常
-- T1验证通过率: 0% (0.5B模型太小，无法生成有效模板+代码，预期行为)
-- 由于T1全部失败，T2/T3/T4被跳过，仅T1 batch参与更新
-- 脚本: `test_adar_selfplay_full_0.5b_20260330.sh` (已标记TESTED: YES)
-
-### 完整Self-Play模式 (Qwen3-4B)
-- 服务器: A6000-6, GPU 3,4
-- 模型: Qwen3-4B
-- 配置: batch_size=8, max_prompt/response_length=512, n1=n2=n3=n4=n5=2, param_offload=True, optimizer_offload=True, gpu_memory_utilization=0.5
-- 结果: 成功完成25个training steps，checkpoint保存正常
-- T1验证通过率: ~44% (11/25 steps触发完整T1→T2→T3→T4 pipeline)
-- 4B模型能够生成有效的模板+代码，成功触发完整pipeline
-- 脚本: `test_adar_selfplay_qwen3_4b_20260330.sh` (已标记TESTED: YES)
-
-### 测试过程中修复的问题
-1. **flashinfer JIT编译失败**: 其他用户的Ray集群导致worker使用错误CUDA路径。通过`_temp_dir`隔离Ray session解决。
-2. **DataProto union冲突**: `generate_sequences`返回的`input_ids`与输入不同。改为直接使用gen_output，仅合并non_tensor数据。
-3. **ref_log_prob缺失**: Self-Play路径中`_compute_advantage_for_stage`未计算reference policy log_prob。添加了ref_log_prob计算。
-4. **多阶段batch序列长度不匹配**: 不同阶段(T1/T2/T3/T4)生成的序列长度不同，`DataProto.concat`要求所有tensor的dim-1一致。修复: 按key计算最大dim-1，对较短tensor进行zero-padding。
-5. **DataProto比较错误**: `valid_batches.index(b)`触发TensorDict的`__eq__`导致shape mismatch。修复: 使用`enumerate`替代。
-6. **non_tensor_batch维度不匹配**: 不同阶段的non_tensor_batch结构不同(2D vs 1D数组)。修复: concat前清除non_tensor_batch。
-7. **CUDA OOM (Qwen3-4B)**: 4B模型在2x48GB GPU上显存不足。修复: 启用param_offload和optimizer_offload，降低gpu_memory_utilization到0.5。
-8. **常量变量导致扰动拒绝**: `auto_pipeline.py`的`randomize_code_once()`中，代码里无模板占位符的变量(如`days_in_week=7`)会导致整个样本被拒绝。修复: 与`AdaR/scripts/perturb_variables.py`同步，将无占位符变量视为常量跳过，只扰动有占位符的变量。

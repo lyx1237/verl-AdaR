@@ -1,0 +1,64 @@
+# AdaR Self-Play Trainer 配置
+# 继承verl的ppo_trainer基础配置, 添加self-play特有参数
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: naive
+  overlong_buffer:
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: null
+    max_num_gen_batches: 0
+
+trainer:
+  project_name: AdaR-SelfPlay
+  experiment_name: adar_selfplay
+
+# ====== AdaR Self-Play 专有配置 ======
+adar_selfplay:
+  # 是否启用self-play模式 (False则退化为标准GRPO)
+  enable_selfplay: False
+
+  # 可选阶段开关 (仅在enable_selfplay=True时生效)
+  enable_t2_evs: True           # 是否启用T2+EVS筛选
+  enable_t3_paraphrase: True    # 是否启用T3+paraphrase
+
+  # rollout次数
+  n1: 4    # T1: 模板+代码生成 (每个原始问题rollout的次数)
+  n2: 5    # 扰动次数 (非模型, CPU执行)
+  n3: 8    # T2: 解答扰动题 (每个扰动问题rollout的次数)
+  n4: 4    # T3: paraphrase (每个问题rollout的次数)
+  n5: 8    # T4: 解答paraphrase题 (每个问题rollout的次数)
+
+  # loss权重 (4个阶段的loss加权系数)
+  w1: 0.2  # T1 loss权重
+  w2: 0.3  # T2 loss权重
+  w3: 0.2  # T3 loss权重
+  w4: 0.3  # T4 loss权重
+
+  # 扰动参数
+  perturb_alpha: 5              # 扰动幅度
+  perturb_timeout: 30           # 单样本扰动总超时(秒)
+  code_timeout: 2.0             # 单次代码执行超时(秒)
+
+  # 各阶段最大序列长度
+  max_template_code_length: 2048  # T1输出最大长度
+  max_solve_length: 2048          # T2,T4输出最大长度
+  max_paraphrase_length: 1024     # T3输出最大长度

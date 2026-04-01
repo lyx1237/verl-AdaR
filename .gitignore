@@ -1,4 +1,10 @@
 
+# AdaR Self-Play: data, models, checkpoints, logs
+ckpt/
+data/
+models/
+.tmp/
+
 **/*.pt
 **/checkpoints
 **/wget-log

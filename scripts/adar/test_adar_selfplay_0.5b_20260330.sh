@@ -1,9 +1,9 @@
 #!/bin/bash
-# TESTED: YES (2026-03-30, A6000-4 GPUs 4,5, T4-only模式, 11 steps完成)
-# 实验目的: 测试AdaR Self-Play训练流程能否跑通 (T4-only模式, 即标准GRPO)
-# 主要配置: GRPO, 2xGPU, Qwen2.5-0.5B-Instruct, 200样本, T4-only模式
+# TESTED: YES (2026-03-30, A6000-4 GPUs 4,5, Stage4-only模式, 11 steps完成)
+# 实验目的: 测试AdaR Self-Play训练流程能否跑通 (Stage4-only模式, 即标准GRPO)
+# 主要配置: GRPO, 2xGPU, Qwen2.5-0.5B-Instruct, 200样本, Stage4-only模式
 # 日期: 2026-03-30
-# 说明: 先测试T4-only模式 (enable_selfplay=False), 确认基本流程正常后
+# 说明: 先测试Stage4-only模式 (enable_selfplay=False), 确认基本流程正常后
 #       再测试完整self-play模式
 
 set -x
@@ -15,28 +15,23 @@ export CUDACXX=$CUDA_HOME/bin/nvcc
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
-VERL_DIR="/home/zfs01/liyx/verl"
-# 确保venv中的工具在PATH中
-export PATH="$PROJECT_DIR/.venv/bin:$PATH"
-# 将AdaR scripts加入PYTHONPATH (供reward_func导入)
-export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+VERL_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONDA_PYTHON="conda run --no-capture-output -n lyx-verl python"
 # 避免连接到远程或其他用户的Ray集群
 unset RAY_ADDRESS
 
 # === 路径配置 ===
 MODEL_PATH="/home/nfs04/model/Qwen2.5/Qwen2.5-0.5B-Instruct"
-TRAIN_DATA="$PROJECT_DIR/data/selfplay/train_selfplay_200.parquet"
-CKPT_DIR="$PROJECT_DIR/ckpt/test_selfplay_0.5b"
-LOG_DIR="$PROJECT_DIR/logs"
+TRAIN_DATA="$VERL_DIR/data/selfplay/train_selfplay_200.parquet"
+CKPT_DIR="$VERL_DIR/ckpt/test_selfplay_0.5b"
+LOG_DIR="$VERL_DIR/logs"
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
 # === 预处理: 准备数据 ===
 echo "---PREP--- 准备self-play训练数据..."
-$VENV_PYTHON "$SCRIPT_DIR/prepare_selfplay_data.py" \
-    "$PROJECT_DIR/data/raw/orca_200.json" \
+$CONDA_PYTHON "$SCRIPT_DIR/prepare_selfplay_data.py" \
+    "$VERL_DIR/data/raw/orca_200.json" \
     "$TRAIN_DATA"
 
 if [ $? -ne 0 ]; then
@@ -45,7 +40,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # === 预处理: 验证数据 ===
-$VENV_PYTHON -c "
+$CONDA_PYTHON -c "
 import pandas as pd
 df = pd.read_parquet('$TRAIN_DATA')
 print(f'---DATA--- Self-Play训练数据加载成功')
@@ -60,7 +55,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # === 验证模块导入 ===
-$VENV_PYTHON -c "
+$CONDA_PYTHON -c "
 import sys
 sys.path.insert(0, '$VERL_DIR')
 from recipe.adar_selfplay.auto_pipeline import SafeExecutor
@@ -75,10 +70,10 @@ if [ $? -ne 0 ]; then
 fi
 
 # === 验证reward函数 ===
-$VENV_PYTHON -c "
+$CONDA_PYTHON -c "
 import sys
-sys.path.insert(0, '$SCRIPT_DIR')
-from reward_func import register_adar_reward, compute_score
+sys.path.insert(0, '$VERL_DIR')
+from recipe.adar_selfplay.reward_func import register_adar_reward, compute_score
 register_adar_reward()
 score = compute_score('The answer is \\\boxed{42}', '42.0')
 print(f'---REWARD--- Test score: {score}')
@@ -91,11 +86,11 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# === T4-Only测试训练 (标准GRPO) ===
-echo "---TRAIN--- 开始T4-Only测试训练..."
+# === Stage4-Only测试训练 (标准GRPO) ===
+echo "---TRAIN--- 开始Stage4-Only测试训练..."
 cd "$VERL_DIR"
 
-$VENV_PYTHON -m recipe.adar_selfplay.run_adar_selfplay \
+$CONDA_PYTHON -m recipe.adar_selfplay.run_adar_selfplay \
     algorithm.adv_estimator=grpo \
     data.train_files="$TRAIN_DATA" \
     data.val_files="$TRAIN_DATA" \
@@ -141,4 +136,4 @@ $VENV_PYTHON -m recipe.adar_selfplay.run_adar_selfplay \
     adar_selfplay.enable_selfplay=False \
     2>&1 | tee "$LOG_DIR/test_selfplay_t4only_$(date +%Y%m%d_%H%M%S).log"
 
-echo "---TEST--- T4-Only测试完成, exit code: $?"
+echo "---TEST--- Stage4-Only测试完成, exit code: $?"

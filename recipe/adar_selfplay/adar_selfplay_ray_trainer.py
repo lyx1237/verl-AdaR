@@ -4,15 +4,15 @@ RayAdaRSelfPlayTrainer (adar_selfplay_ray_trainer.py)
 自定义Trainer, 继承RayPPOTrainer, 实现AdaR Self-Play的4阶段训练流水线.
 
 4个阶段:
-  T1: 生成模板+代码 → 自动校验+扰动
-  T2: 解答扰动问题 → EVS筛选
-  T3: Paraphrase → 构造新的问题
-  T4: 解答paraphrase后的问题 → 计算reward
+  Stage1: 生成模板+代码 → 自动校验+扰动
+  Stage2: 解答扰动问题 → EVS筛选
+  Stage3: Paraphrase → 构造新的问题
+  Stage4: 解答paraphrase后的问题 → 计算reward
 
 阶段启用控制 (通过配置):
   - enable_selfplay=False时, 只运行T4 (等同于标准GRPO)
-  - enable_selfplay=True时, 运行全部T1~T4
-  - enable_t2_evs, enable_t3_paraphrase 可分别控制T2和T3
+  - enable_selfplay=True时, 运行全部Stage1~Stage4
+  - enable_stage3_paraphrase 控制是否启用Stage3+Stage4 (关闭则只做Stage1+Stage2)
 
 所有阶段共享同一个actor模型, 4个阶段的loss按权重加权后一起更新.
 """
@@ -45,10 +45,10 @@ from verl.utils.debug import marked_timer
 from .prompt_builder import PromptBuilder
 from .auto_pipeline import SafeExecutor, parse_and_verify, perturb_variables, check_evs, compute_evs_accuracy
 from .adar_selfplay_reward import (
-    compute_t1_reward,
-    compute_t2_reward,
-    compute_t3_reward,
-    compute_t4_reward,
+    compute_stage1_reward,
+    compute_stage2_reward,
+    compute_stage3_reward,
+    compute_stage4_reward,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,21 +75,20 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         # 读取self-play配置
         sp_cfg = self.config.get("adar_selfplay", {})
         self.enable_selfplay = sp_cfg.get("enable_selfplay", False)
-        self.enable_t2_evs = sp_cfg.get("enable_t2_evs", True)
-        self.enable_t3_paraphrase = sp_cfg.get("enable_t3_paraphrase", True)
+        self.enable_stage3_paraphrase = sp_cfg.get("enable_stage3_paraphrase", True)
 
         # rollout次数
-        self.n1 = sp_cfg.get("n1", 4)   # T1: 模板+代码生成
+        self.n1 = sp_cfg.get("n1", 4)   # Stage1: 模板+代码生成
         self.n2 = sp_cfg.get("n2", 5)   # 扰动次数 (非模型)
-        self.n3 = sp_cfg.get("n3", 8)   # T2: 解答扰动题
-        self.n4 = sp_cfg.get("n4", 4)   # T3: paraphrase
-        self.n5 = sp_cfg.get("n5", 8)   # T4: 解答paraphrase题
+        self.n3 = sp_cfg.get("n3", 8)   # Stage2: 解答扰动题
+        self.n4 = sp_cfg.get("n4", 4)   # Stage3: paraphrase
+        self.n5 = sp_cfg.get("n5", 8)   # Stage4: 解答paraphrase题
 
         # loss权重
-        self.w1 = sp_cfg.get("w1", 0.2)  # T1 loss权重
-        self.w2 = sp_cfg.get("w2", 0.3)  # T2 loss权重
-        self.w3 = sp_cfg.get("w3", 0.2)  # T3 loss权重
-        self.w4 = sp_cfg.get("w4", 0.3)  # T4 loss权重
+        self.w1 = sp_cfg.get("w1", 0.2)  # Stage1 loss权重
+        self.w2 = sp_cfg.get("w2", 0.3)  # Stage2 loss权重
+        self.w3 = sp_cfg.get("w3", 0.2)  # Stage3 loss权重
+        self.w4 = sp_cfg.get("w4", 0.3)  # Stage4 loss权重
 
         # 扰动参数
         self.perturb_alpha = sp_cfg.get("perturb_alpha", 5)
@@ -101,10 +100,16 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         self.max_solve_length = sp_cfg.get("max_solve_length", 2048)
         self.max_paraphrase_length = sp_cfg.get("max_paraphrase_length", 1024)
 
-        mode_str = "Self-Play (T1~T4)" if self.enable_selfplay else "T4-Only (标准GRPO)"
+        # Debug: 注入假的T1通过结果, 用于测试完整pipeline
+        self.debug_inject_stage1 = sp_cfg.get("debug_inject_stage1", False)
+
+        mode_str = "Self-Play (Stage1~Stage4)" if self.enable_selfplay else "Stage4-Only (标准GRPO)"
         logger.info(f"---SELFPLAY--- 模式: {mode_str}")
+        if self.debug_inject_stage1:
+            logger.info("---SELFPLAY--- ⚠ DEBUG模式: 注入假T1结果, 仅供测试!")
+            print("---SELFPLAY--- ⚠ DEBUG模式: 注入假T1结果, 仅供测试!")
         if self.enable_selfplay:
-            logger.info(f"---SELFPLAY--- T2_EVS: {self.enable_t2_evs}, T3_Paraphrase: {self.enable_t3_paraphrase}")
+            logger.info(f"---SELFPLAY--- T3_Paraphrase: {self.enable_stage3_paraphrase}")
             logger.info(f"---SELFPLAY--- rollout次数: n1={self.n1}, n2={self.n2}, n3={self.n3}, n4={self.n4}, n5={self.n5}")
             logger.info(f"---SELFPLAY--- loss权重: w1={self.w1}, w2={self.w2}, w3={self.w3}, w4={self.w4}")
         print(f"---SELFPLAY--- 模式: {mode_str}")
@@ -120,6 +125,81 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
             texts.append(text)
         return texts
+
+    def _debug_make_fake_t1(self, queries, answers, n_prompts):
+        """
+        DEBUG: 为每个问题生成假的T1通过结果.
+        - rollout 0: 所有问题都通过 (有效的template+code)
+        - rollout 1: 只有偶数问题通过 (测试per-rollout逻辑)
+        """
+        # 通用模板: 用简单的乘法/加法模板, 变量可被perturb_variables扰动
+        fake_templates = {
+            # query含 "X dollars each" + "Y apples" → price*count
+            "apples": ("A store sells apples for <price> dollars each. If Tom buys <count> apples, how much does he pay in total?",
+                       "price = {p}\ncount = {c}\nresult = price * count\nprint(result)"),
+            # length*width
+            "rectangle": ("A rectangle has a length of <length> cm and a width of <width> cm. What is the area of the rectangle?",
+                          "length = {p}\nwidth = {c}\nresult = length * width\nprint(result)"),
+            # a - b
+            "candies": ("Sarah has <total> candies. She gives <give> candies to her friend. How many candies does Sarah have left?",
+                        "total = {p}\ngive = {c}\nresult = total - give\nprint(result)"),
+            # speed * time
+            "car": ("A car travels at a speed of <speed> km/h for <hours> hours. How far does it travel?",
+                    "speed = {p}\nhours = {c}\nresult = speed * hours\nprint(result)"),
+            # boxes * per_box
+            "boxes": ("John has <boxes> boxes. Each box contains <per_box> pencils. How many pencils does John have in total?",
+                      "boxes = {p}\nper_box = {c}\nresult = boxes * per_box\nprint(result)"),
+            # 0.5 * base * height
+            "triangle": ("A triangle has a base of <base> meters and a height of <height> meters. What is its area?",
+                         "base = {p}\nheight = {c}\nresult = 0.5 * base * height\nprint(result)"),
+            # per_day * days
+            "baker": ("A baker makes <per_day> cakes per day. How many cakes does the baker make in <days> days?",
+                      "per_day = {p}\ndays = {c}\nresult = per_day * days\nprint(result)"),
+            # price * (1 - discount)
+            "shirt": ("If a shirt costs <price> dollars and there is a <discount_pct> percent discount, what is the final price?",
+                      "price = {p}\ndiscount_pct = {c}\nresult = price * (1 - discount_pct / 100)\nprint(result)"),
+        }
+
+        # 关键词→模板的映射
+        keyword_map = [
+            ("apples", "apples", 3, 5),
+            ("rectangle", "rectangle", 8, 6),
+            ("candies", "candies", 20, 7),
+            ("speed", "car", 60, 3),
+            ("boxes", "boxes", 4, 12),
+            ("triangle", "triangle", 10, 6),
+            ("baker", "baker", 15, 4),
+            ("shirt", "shirt", 25, 20),
+        ]
+
+        stage1_passed = {}
+        for p_idx in range(n_prompts):
+            q = queries[p_idx].lower()
+            # 找匹配的模板
+            matched = None
+            for keyword, tpl_key, param_p, param_c in keyword_map:
+                if keyword in q:
+                    template, code_tpl = fake_templates[tpl_key]
+                    code = code_tpl.format(p=param_p, c=param_c)
+                    matched = {"template": template, "python": code}
+                    break
+
+            if matched is None:
+                # 默认: 用一个通用模板
+                ans_val = float(answers[p_idx]) if answers[p_idx] else 0
+                matched = {
+                    "template": queries[p_idx],
+                    "python": f"result = {ans_val}\nprint(result)",
+                }
+
+            # rollout 0: 所有问题都通过
+            stage1_passed[(p_idx, 0)] = matched
+
+            # rollout 1: 只有偶数问题通过 (测试per-rollout差异)
+            if p_idx % 2 == 0:
+                stage1_passed[(p_idx, 1)] = matched
+
+        return stage1_passed
 
     def _generate_for_stage(
         self,
@@ -176,7 +256,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         每个阶段的batch已经包含了reward (token_level_scores)和advantage.
 
         Returns:
-            stage_batches: [t1_batch, t2_batch, t3_batch, t4_batch]
+            stage_batches: [stage1_batch, stage2_batch, stage3_batch, stage4_batch]
             其中未启用的阶段对应None
         """
         # 从原始数据中获取queries和answers
@@ -216,72 +296,75 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         logger.info(f"---SELFPLAY--- 开始pipeline, {n_prompts}个原始问题")
         print(f"---SELFPLAY--- 开始pipeline, {n_prompts}个原始问题")
 
-        stage_batches = [None, None, None, None]  # T1, T2, T3, T4
+        stage_batches = [None, None, None, None]  # Stage1, Stage2, Stage3, Stage4
 
-        # ====== Stage 1: 生成模板+代码 (T1) ======
-        t1_batch = None
-        templates = [None] * n_prompts
-        python_codes = [None] * n_prompts
-        verify_passed = [False] * n_prompts
-        perturb_passed = [False] * n_prompts
-        evs_passed_list = [False] * n_prompts
+        # ====== Stage 1: 生成模板+代码 (Stage1) ======
+        # 每个rollout独立评估, 不再只取第一个通过的
+        stage1_batch = None
+        # (p_idx, r_idx) -> {"template": ..., "python": ...} 通过parse_and_verify的rollout
+        stage1_passed_rollouts = {}
 
-        with marked_timer("stage1_t1", timing_raw, color="blue"):
-            logger.info("---STAGE1--- T1: 生成模板和代码")
-            print("---STAGE1--- T1: 生成模板和代码")
+        with marked_timer("stage1", timing_raw, color="blue"):
+            logger.info("---STAGE1--- Stage1: 生成模板和代码")
+            print("---STAGE1--- Stage1: 生成模板和代码")
 
-            # 构造T1 prompt
-            t1_prompt_batch = self.prompt_builder.build_t1_prompts(
+            stage1_prompt_batch = self.prompt_builder.build_stage1_prompts(
                 queries=queries,
                 responses=responses_for_t1,
                 max_length=self.max_template_code_length,
             )
 
-            # 生成
-            t1_batch = self._generate_for_stage(
-                t1_prompt_batch, self.n1, "T1", timing_raw
+            stage1_batch = self._generate_for_stage(
+                stage1_prompt_batch, self.n1, "Stage1", timing_raw
             )
 
-            # 解码并校验
-            t1_responses = self._decode_responses(t1_batch)
+            stage1_responses = self._decode_responses(stage1_batch)
 
-            # 对每个原始问题, 检查其n1个rollout中是否有通过校验的
-            for p_idx in range(n_prompts):
-                for r_idx in range(self.n1):
-                    flat_idx = p_idx * self.n1 + r_idx
-                    if flat_idx >= len(t1_responses):
-                        break
-                    result = parse_and_verify(
-                        generation=t1_responses[flat_idx],
-                        query=queries[p_idx],
-                        answer=answers[p_idx],
-                        executor=self.executor,
-                        code_timeout=self.code_timeout,
-                    )
-                    if result is not None:
-                        templates[p_idx] = result["template"]
-                        python_codes[p_idx] = result["python"]
-                        verify_passed[p_idx] = True
-                        break  # 一个通过即可
+            # 对每个rollout独立检查parse_and_verify
+            if self.debug_inject_stage1:
+                # DEBUG模式: 注入假T1结果
+                # rollout 0 对所有问题都通过, rollout 1 只对偶数问题通过
+                stage1_passed_rollouts = self._debug_make_fake_t1(queries, answers, n_prompts)
+                print(f"---DEBUG--- 注入假T1结果: {len(stage1_passed_rollouts)} rollouts通过")
+            else:
+                for p_idx in range(n_prompts):
+                    for r_idx in range(self.n1):
+                        flat_idx = p_idx * self.n1 + r_idx
+                        if flat_idx >= len(stage1_responses):
+                            break
+                        result = parse_and_verify(
+                            generation=stage1_responses[flat_idx],
+                            query=queries[p_idx],
+                            answer=answers[p_idx],
+                            executor=self.executor,
+                            code_timeout=self.code_timeout,
+                        )
+                        if result is not None:
+                            stage1_passed_rollouts[(p_idx, r_idx)] = {
+                                "template": result["template"],
+                                "python": result["python"],
+                            }
 
-            passed_t1 = sum(verify_passed)
-            logger.info(f"---STAGE1--- T1校验通过: {passed_t1}/{n_prompts}")
-            print(f"---STAGE1--- T1校验通过: {passed_t1}/{n_prompts}")
-            metrics["selfplay/t1_verify_pass_rate"] = passed_t1 / max(n_prompts, 1)
+            k1 = len(stage1_passed_rollouts)
+            n_prompts_with_pass = len(set(k[0] for k in stage1_passed_rollouts))
+            logger.info(f"---STAGE1--- Stage1校验通过: {k1}/{n_prompts * self.n1} rollouts "
+                        f"(来自 {n_prompts_with_pass}/{n_prompts} 个问题)")
+            print(f"---STAGE1--- Stage1校验通过: {k1}/{n_prompts * self.n1} rollouts")
+            metrics["selfplay/stage1_verify_pass_rate"] = k1 / max(n_prompts * self.n1, 1)
+            metrics["selfplay/stage1_verify_prompt_rate"] = n_prompts_with_pass / max(n_prompts, 1)
 
-        # ====== Stage 1.5: 自动扰动 (CPU, 非模型) ======
-        perturbed_data = {}  # p_idx -> list of perturbation dicts
+        # ====== Stage 1.5: 自动扰动 (对每个通过的Stage1 rollout分别扰动) ======
+        # (p_idx, r_idx) -> list of perturbation dicts
+        perturbed_data = {}
 
         with marked_timer("stage1.5_perturb", timing_raw, color="blue"):
             logger.info("---STAGE1.5--- 自动扰动")
             print("---STAGE1.5--- 自动扰动")
 
-            for p_idx in range(n_prompts):
-                if not verify_passed[p_idx]:
-                    continue
+            for (p_idx, r_idx), rollout_result in stage1_passed_rollouts.items():
                 perturbations = perturb_variables(
-                    template=templates[p_idx],
-                    python_code=python_codes[p_idx],
+                    template=rollout_result["template"],
+                    python_code=rollout_result["python"],
                     answer=answers[p_idx],
                     executor=self.executor,
                     n_perturbations=self.n2,
@@ -290,236 +373,381 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                     code_timeout=self.code_timeout,
                 )
                 if perturbations:
-                    perturbed_data[p_idx] = perturbations
-                    perturb_passed[p_idx] = True
+                    perturbed_data[(p_idx, r_idx)] = perturbations
 
-            passed_perturb = sum(perturb_passed)
-            logger.info(f"---STAGE1.5--- 扰动通过: {passed_perturb}/{n_prompts}")
-            print(f"---STAGE1.5--- 扰动通过: {passed_perturb}/{n_prompts}")
-            metrics["selfplay/perturb_pass_rate"] = passed_perturb / max(n_prompts, 1)
+            logger.info(f"---STAGE1.5--- 扰动完成: {len(perturbed_data)}/{k1} rollouts有扰动")
+            print(f"---STAGE1.5--- 扰动完成: {len(perturbed_data)}/{k1} rollouts有扰动")
+            metrics["selfplay/perturb_pass_rate"] = len(perturbed_data) / max(k1, 1)
 
-        # ====== Stage 2: 解答扰动问题 (T2) ======
-        t2_batch = None
-        passed_perturbations = {}  # p_idx -> list of perturbation dicts that passed EVS
+        # ====== Stage 2: 解答扰动问题 + EVS筛选 (Stage2) ======
+        stage2_batch = None
+        stage2_expected_answers = []
+        # (p_idx, r_idx) -> list of perturbation dicts that passed EVS
+        passed_perturbations = {}
 
-        if self.enable_t2_evs and perturbed_data:
-            with marked_timer("stage2_t2", timing_raw, color="green"):
-                logger.info("---STAGE2--- T2: 解答扰动问题 + EVS筛选")
-                print("---STAGE2--- T2: 解答扰动问题 + EVS筛选")
+        if perturbed_data:
+            with marked_timer("stage2", timing_raw, color="green"):
+                logger.info("---STAGE2--- Stage2: 解答扰动问题 + EVS筛选")
+                print("---STAGE2--- Stage2: 解答扰动问题 + EVS筛选")
 
-                # 收集所有扰动问题
-                t2_queries = []
-                t2_codes = []
-                t2_expected_answers = []
-                t2_source_indices = []  # 记录每个扰动问题来自哪个原始问题
+                stage2_queries = []
+                stage2_codes = []
+                stage2_expected_answers = []
+                stage2_source_keys = []  # (p_idx, r_idx) for each perturbation
 
-                for p_idx, perturbations in perturbed_data.items():
+                for (p_idx, r_idx), perturbations in perturbed_data.items():
                     for pert in perturbations:
-                        t2_queries.append(pert["new_query"])
-                        t2_codes.append(pert["new_code"])
-                        t2_expected_answers.append(pert["new_ans"])
-                        t2_source_indices.append(p_idx)
+                        stage2_queries.append(pert["new_query"])
+                        stage2_codes.append(pert["new_code"])
+                        stage2_expected_answers.append(pert["new_ans"])
+                        stage2_source_keys.append((p_idx, r_idx))
 
-                if t2_queries:
-                    # 构造T2 prompt
-                    t2_prompt_batch = self.prompt_builder.build_t2_prompts(
-                        queries=t2_queries,
-                        codes=t2_codes,
+                if stage2_queries:
+                    stage2_prompt_batch = self.prompt_builder.build_stage2_prompts(
+                        queries=stage2_queries,
+                        codes=stage2_codes,
                         max_length=self.max_solve_length,
                     )
 
-                    # 生成
-                    t2_batch = self._generate_for_stage(
-                        t2_prompt_batch, self.n3, "T2", timing_raw
+                    stage2_batch = self._generate_for_stage(
+                        stage2_prompt_batch, self.n3, "Stage2", timing_raw
                     )
 
                     # EVS筛选: 对每个扰动问题, 检查n3个回答中是否有正确的
-                    t2_responses = self._decode_responses(t2_batch)
+                    stage2_responses = self._decode_responses(stage2_batch)
 
-                    for q_idx in range(len(t2_queries)):
+                    for q_idx in range(len(stage2_queries)):
                         responses_for_q = []
-                        for r_idx in range(self.n3):
-                            flat_idx = q_idx * self.n3 + r_idx
-                            if flat_idx < len(t2_responses):
-                                responses_for_q.append(t2_responses[flat_idx])
+                        for r_idx_inner in range(self.n3):
+                            flat_idx = q_idx * self.n3 + r_idx_inner
+                            if flat_idx < len(stage2_responses):
+                                responses_for_q.append(stage2_responses[flat_idx])
 
                         passed, _ = check_evs(
                             model_responses=responses_for_q,
-                            expected_answer=t2_expected_answers[q_idx],
+                            expected_answer=stage2_expected_answers[q_idx],
                         )
 
                         if passed:
-                            p_idx = t2_source_indices[q_idx]
-                            if p_idx not in passed_perturbations:
-                                passed_perturbations[p_idx] = []
-                            # 记录通过的扰动及其相关信息
-                            pert_idx_in_list = sum(1 for si in t2_source_indices[:q_idx] if si == p_idx)
-                            passed_perturbations[p_idx].append({
-                                "query": t2_queries[q_idx],
-                                "code": t2_codes[q_idx],
-                                "answer": t2_expected_answers[q_idx],
+                            key = stage2_source_keys[q_idx]
+                            if key not in passed_perturbations:
+                                passed_perturbations[key] = []
+                            passed_perturbations[key].append({
+                                "query": stage2_queries[q_idx],
+                                "code": stage2_codes[q_idx],
+                                "answer": stage2_expected_answers[q_idx],
                             })
-                            evs_passed_list[p_idx] = True
 
-                    passed_evs = sum(evs_passed_list)
-                    logger.info(f"---STAGE2--- EVS通过: {passed_evs}/{n_prompts}")
-                    print(f"---STAGE2--- EVS通过: {passed_evs}/{n_prompts}")
-                    metrics["selfplay/evs_pass_rate"] = passed_evs / max(n_prompts, 1)
-        else:
-            # 不启用T2_EVS: 所有扰动都算通过
-            for p_idx, perturbations in perturbed_data.items():
-                passed_perturbations[p_idx] = [
-                    {"query": p["new_query"], "code": p["new_code"], "answer": p["new_ans"]}
-                    for p in perturbations
-                ]
-                evs_passed_list[p_idx] = True
+                    total_passed_perts = sum(len(v) for v in passed_perturbations.values())
+                    logger.info(f"---STAGE2--- EVS通过: {total_passed_perts}/{len(stage2_queries)} 扰动, "
+                                f"涉及 {len(passed_perturbations)}/{len(perturbed_data)} rollouts")
+                    print(f"---STAGE2--- EVS通过: {total_passed_perts}/{len(stage2_queries)} 扰动")
+                    metrics["selfplay/evs_pass_rate"] = total_passed_perts / max(len(stage2_queries), 1)
+                    metrics["selfplay/evs_rollout_rate"] = len(passed_perturbations) / max(len(perturbed_data), 1)
 
-        # ====== Stage 3: Paraphrase (T3) ======
-        t3_batch = None
+        # ====== Stage 3: Paraphrase (Stage3) ======
+        # 收集ALL通过EVS的扰动问题, 不再只取每个prompt的第一个
+        stage3_batch = None
         paraphrased_questions = []  # list of (question_text, expected_answer)
+        stage3_expected_answers = []  # 用于T4的expected answers
 
-        if self.enable_t3_paraphrase and passed_perturbations:
-            with marked_timer("stage3_t3", timing_raw, color="yellow"):
-                logger.info("---STAGE3--- T3: Paraphrase")
-                print("---STAGE3--- T3: Paraphrase")
+        if self.enable_stage3_paraphrase and passed_perturbations:
+            with marked_timer("stage3", timing_raw, color="yellow"):
+                logger.info("---STAGE3--- Stage3: Paraphrase")
+                print("---STAGE3--- Stage3: Paraphrase")
 
-                # 收集需要paraphrase的题目 (每个原始问题取第一个通过EVS的扰动)
-                t3_questions = []
-                t3_expected_answers = []
-                t3_source_indices = []
+                # 收集ALL通过EVS的扰动问题 (a个)
+                stage3_questions = []
+                stage3_expected_answers = []
 
-                for p_idx, perts in passed_perturbations.items():
-                    if perts:
-                        t3_questions.append(perts[0]["query"])
-                        t3_expected_answers.append(perts[0]["answer"])
-                        t3_source_indices.append(p_idx)
+                for key, perts in passed_perturbations.items():
+                    for pert in perts:
+                        stage3_questions.append(pert["query"])
+                        stage3_expected_answers.append(pert["answer"])
 
-                if t3_questions:
-                    t3_prompt_batch = self.prompt_builder.build_t3_prompts(
-                        questions=t3_questions,
+                a_total = len(stage3_questions)
+                logger.info(f"---STAGE3--- 共{a_total}个通过EVS的扰动进入paraphrase")
+                print(f"---STAGE3--- 共{a_total}个通过EVS的扰动进入paraphrase")
+
+                if stage3_questions:
+                    stage3_prompt_batch = self.prompt_builder.build_stage3_prompts(
+                        questions=stage3_questions,
                         max_length=self.max_paraphrase_length,
                     )
 
-                    t3_batch = self._generate_for_stage(
-                        t3_prompt_batch, self.n4, "T3", timing_raw
+                    stage3_batch = self._generate_for_stage(
+                        stage3_prompt_batch, self.n4, "Stage3", timing_raw
                     )
 
-                    # 解码paraphrase结果
-                    t3_responses = self._decode_responses(t3_batch)
+                    # 解码paraphrase结果, 收集ALL非空paraphrase进入T4
+                    stage3_responses = self._decode_responses(stage3_batch)
 
-                    # 每个原始问题取第一个非空paraphrase结果
-                    for q_idx in range(len(t3_questions)):
+                    # stage3_valid_map: t4问题index -> stage3_batch中对应的(q_idx, r_idx)
+                    stage3_valid_map = []
+                    for q_idx in range(len(stage3_questions)):
                         for r_idx in range(self.n4):
                             flat_idx = q_idx * self.n4 + r_idx
-                            if flat_idx < len(t3_responses) and t3_responses[flat_idx].strip():
+                            if flat_idx < len(stage3_responses) and stage3_responses[flat_idx].strip():
                                 paraphrased_questions.append((
-                                    t3_responses[flat_idx].strip(),
-                                    t3_expected_answers[q_idx],
+                                    stage3_responses[flat_idx].strip(),
+                                    stage3_expected_answers[q_idx],
                                 ))
-                                break
+                                stage3_valid_map.append((q_idx, r_idx))
 
-                    logger.info(f"---STAGE3--- Paraphrase完成: {len(paraphrased_questions)}个问题")
-                    print(f"---STAGE3--- Paraphrase完成: {len(paraphrased_questions)}个问题")
-                    metrics["selfplay/paraphrase_count"] = len(paraphrased_questions)
+                    b_total = len(paraphrased_questions)
+                    logger.info(f"---STAGE3--- Paraphrase完成: {b_total}个有效变体问题 "
+                                f"(来自{a_total}个扰动 x {self.n4} rollouts)")
+                    print(f"---STAGE3--- Paraphrase完成: {b_total}个有效变体问题")
+                    metrics["selfplay/paraphrase_count"] = b_total
         else:
-            # 不启用T3: 直接用扰动后的问题
-            for p_idx, perts in passed_perturbations.items():
-                if perts:
-                    paraphrased_questions.append((
-                        perts[0]["query"],
-                        perts[0]["answer"],
-                    ))
+            stage3_valid_map = []
 
-        # ====== Stage 4: 解答paraphrase后的问题 (T4) ======
-        t4_batch = None
+        # ====== Stage 4: 解答paraphrase后的问题 (Stage4) ======
+        stage4_batch = None
 
         if paraphrased_questions:
-            with marked_timer("stage4_t4", timing_raw, color="red"):
-                logger.info(f"---STAGE4--- T4: 解答{len(paraphrased_questions)}个问题")
-                print(f"---STAGE4--- T4: 解答{len(paraphrased_questions)}个问题")
+            with marked_timer("stage4", timing_raw, color="red"):
+                logger.info(f"---STAGE4--- Stage4: 解答{len(paraphrased_questions)}个问题")
+                print(f"---STAGE4--- Stage4: 解答{len(paraphrased_questions)}个问题")
 
-                t4_questions = [q for q, _ in paraphrased_questions]
-                t4_expected_answers = [a for _, a in paraphrased_questions]
+                stage4_questions = [q for q, _ in paraphrased_questions]
 
-                t4_prompt_batch = self.prompt_builder.build_t4_prompts(
-                    questions=t4_questions,
+                stage4_prompt_batch = self.prompt_builder.build_stage4_prompts(
+                    questions=stage4_questions,
                     max_length=self.max_solve_length,
                 )
 
-                t4_batch = self._generate_for_stage(
-                    t4_prompt_batch, self.n5, "T4", timing_raw
+                stage4_batch = self._generate_for_stage(
+                    stage4_prompt_batch, self.n5, "Stage4", timing_raw
                 )
 
-                logger.info(f"---STAGE4--- T4生成完成")
-                print(f"---STAGE4--- T4生成完成")
+                logger.info(f"---STAGE4--- Stage4生成完成")
+                print(f"---STAGE4--- Stage4生成完成")
 
         # ====== 计算各阶段reward ======
         logger.info("---REWARD--- 开始计算各阶段reward")
         print("---REWARD--- 开始计算各阶段reward")
 
-        # T1 reward
-        if t1_batch is not None:
-            t1_rewards = compute_t1_reward(
-                batch_size=len(t1_batch),
-                verify_passed=[verify_passed[i // self.n1] for i in range(len(t1_batch))],
-                perturb_passed=[perturb_passed[i // self.n1] for i in range(len(t1_batch))],
-                evs_passed=[evs_passed_list[i // self.n1] for i in range(len(t1_batch))],
+        # Stage1 reward (per-rollout: 基于EVS结果)
+        if stage1_batch is not None:
+            stage1_rewards = compute_stage1_reward(
+                n_prompts=n_prompts,
+                n1=self.n1,
+                stage1_passed_rollouts=stage1_passed_rollouts,
+                passed_perturbations=passed_perturbations,
             )
-            # 放到token_level_scores
-            seq_len = t1_batch.batch["attention_mask"].shape[1]
-            t1_batch.batch["token_level_scores"] = torch.zeros(len(t1_batch), seq_len)
-            t1_batch.batch["token_level_scores"][:, -1] = t1_rewards
-            t1_batch.batch["token_level_rewards"] = t1_batch.batch["token_level_scores"].clone()
-            metrics["selfplay/t1_avg_reward"] = t1_rewards.mean().item()
+            seq_len = stage1_batch.batch["attention_mask"].shape[1]
+            stage1_batch.batch["token_level_scores"] = torch.zeros(len(stage1_batch), seq_len)
+            stage1_batch.batch["token_level_scores"][:, -1] = stage1_rewards
+            stage1_batch.batch["token_level_rewards"] = stage1_batch.batch["token_level_scores"].clone()
+            metrics["selfplay/stage1_avg_reward"] = stage1_rewards.mean().item()
 
-        # T4 reward (先计算, 因为T3 reward依赖T4的accuracy)
-        t4_accuracies = []
-        if t4_batch is not None:
-            t4_responses = self._decode_responses(t4_batch)
-            t4_expected = [a for _, a in paraphrased_questions]
-            t4_reward_scores, t4_accuracies = compute_t4_reward(
-                responses=t4_responses,
-                expected_answers=t4_expected,
+        # Stage4 reward (先计算, 因为Stage3 reward依赖Stage4的accuracy)
+        # Stage4: 全错的group masked out
+        stage4_accuracies = []
+        if stage4_batch is not None:
+            stage4_responses = self._decode_responses(stage4_batch)
+            stage4_expected = [a for _, a in paraphrased_questions]
+            stage4_reward_scores, stage4_accuracies, stage4_training_mask = compute_stage4_reward(
+                responses=stage4_responses,
+                expected_answers=stage4_expected,
                 group_size=self.n5,
             )
-            seq_len = t4_batch.batch["attention_mask"].shape[1]
-            t4_batch.batch["token_level_scores"] = torch.zeros(len(t4_batch), seq_len)
-            for i in range(len(t4_batch)):
-                t4_batch.batch["token_level_scores"][i, -1] = t4_reward_scores[i]
-            t4_batch.batch["token_level_rewards"] = t4_batch.batch["token_level_scores"].clone()
-            metrics["selfplay/t4_avg_reward"] = t4_reward_scores.mean().item()
-            metrics["selfplay/t4_avg_accuracy"] = np.mean(t4_accuracies) if t4_accuracies else 0.0
+            seq_len = stage4_batch.batch["attention_mask"].shape[1]
+            stage4_batch.batch["token_level_scores"] = torch.zeros(len(stage4_batch), seq_len)
+            for i in range(len(stage4_batch)):
+                stage4_batch.batch["token_level_scores"][i, -1] = stage4_reward_scores[i]
+            stage4_batch.batch["token_level_rewards"] = stage4_batch.batch["token_level_scores"].clone()
+            # 存储training_mask, 在advantage计算时应用
+            # 存储1D per-sample mask, 在advantage计算时再expand到seq_len
+            stage4_batch.batch["training_mask"] = stage4_training_mask
+            metrics["selfplay/stage4_avg_reward"] = stage4_reward_scores.mean().item()
+            metrics["selfplay/stage4_avg_accuracy"] = np.mean(stage4_accuracies) if stage4_accuracies else 0.0
+            metrics["selfplay/stage4_masked_out_groups"] = sum(1 for acc in stage4_accuracies if acc == 0.0)
 
-        # T2 reward
-        if t2_batch is not None:
-            t2_responses = self._decode_responses(t2_batch)
-            t2_reward_scores, group_has_correct, _ = compute_t2_reward(
-                responses=t2_responses,
-                expected_answers=t2_expected_answers,
+        # Stage2 reward: 全错的group masked out
+        if stage2_batch is not None:
+            stage2_responses = self._decode_responses(stage2_batch)
+            stage2_reward_scores, group_has_correct, stage2_training_mask = compute_stage2_reward(
+                responses=stage2_responses,
+                expected_answers=stage2_expected_answers,
                 group_size=self.n3,
             )
-            seq_len = t2_batch.batch["attention_mask"].shape[1]
-            t2_batch.batch["token_level_scores"] = torch.zeros(len(t2_batch), seq_len)
-            for i in range(len(t2_batch)):
-                t2_batch.batch["token_level_scores"][i, -1] = t2_reward_scores[i]
-            t2_batch.batch["token_level_rewards"] = t2_batch.batch["token_level_scores"].clone()
-            metrics["selfplay/t2_avg_reward"] = t2_reward_scores.mean().item()
+            seq_len = stage2_batch.batch["attention_mask"].shape[1]
+            stage2_batch.batch["token_level_scores"] = torch.zeros(len(stage2_batch), seq_len)
+            for i in range(len(stage2_batch)):
+                stage2_batch.batch["token_level_scores"][i, -1] = stage2_reward_scores[i]
+            stage2_batch.batch["token_level_rewards"] = stage2_batch.batch["token_level_scores"].clone()
+            # 存储training_mask
+            stage2_batch.batch["training_mask"] = stage2_training_mask
+            metrics["selfplay/stage2_avg_reward"] = stage2_reward_scores.mean().item()
+            metrics["selfplay/stage2_masked_out_groups"] = sum(1 for x in group_has_correct if not x)
 
-        # T3 reward (依赖T4 accuracy)
-        if t3_batch is not None and t4_accuracies:
-            t3_reward_scores = compute_t3_reward(
-                t4_accuracies=t4_accuracies,
-                group_size=self.n4,
-            )
-            seq_len = t3_batch.batch["attention_mask"].shape[1]
-            t3_batch.batch["token_level_scores"] = torch.zeros(len(t3_batch), seq_len)
-            for i in range(min(len(t3_batch), len(t3_reward_scores))):
-                t3_batch.batch["token_level_scores"][i, -1] = t3_reward_scores[i]
-            t3_batch.batch["token_level_rewards"] = t3_batch.batch["token_level_scores"].clone()
-            metrics["selfplay/t3_avg_reward"] = t3_reward_scores.mean().item()
+        # Stage3 reward (依赖Stage4 accuracy, 通过stage3_valid_map映射)
+        if stage3_batch is not None and stage4_accuracies:
+            # 将Stage4 accuracy映射回T3的每个paraphrase rollout
+            # stage3_valid_map[j] = (q_idx, r_idx): 第j个Stage4问题对应t3的第q_idx个源问题的第r_idx个rollout
+            # stage4_accuracies[j]: 第j个Stage4问题的准确率
+            # Stage3 reward: 对stage3_batch中每个entry, 找到其对应的Stage4 accuracy
+            n_stage3_sources = len(stage3_expected_answers)  # a: 通过EVS的扰动数
+            stage3_reward_scores = torch.zeros(len(stage3_batch))
 
-        stage_batches = [t1_batch, t2_batch, t3_batch, t4_batch]
+            # 为每个t3 entry找到对应的Stage4 accuracy
+            # stage3_batch有 n_stage3_sources * n4 个entry
+            # stage3_valid_map告诉我们哪些t3 entry产生了有效的Stage4问题
+            stage4_acc_by_stage3_entry = {}  # (q_idx, r_idx) -> stage4_accuracy
+            for j, (q_idx, r_idx) in enumerate(stage3_valid_map):
+                if j < len(stage4_accuracies):
+                    stage4_acc_by_stage3_entry[(q_idx, r_idx)] = stage4_accuracies[j]
+
+            for q_idx in range(n_stage3_sources):
+                for r_idx in range(self.n4):
+                    flat_idx = q_idx * self.n4 + r_idx
+                    if flat_idx >= len(stage3_batch):
+                        break
+                    if (q_idx, r_idx) in stage4_acc_by_stage3_entry:
+                        acc = stage4_acc_by_stage3_entry[(q_idx, r_idx)]
+                        reward = max(0.0, 1.0 - 4.0 * (acc - 0.5) ** 2)
+                        stage3_reward_scores[flat_idx] = reward
+                    # else: 空paraphrase, reward=0
+
+            seq_len = stage3_batch.batch["attention_mask"].shape[1]
+            stage3_batch.batch["token_level_scores"] = torch.zeros(len(stage3_batch), seq_len)
+            for i in range(len(stage3_batch)):
+                stage3_batch.batch["token_level_scores"][i, -1] = stage3_reward_scores[i]
+            stage3_batch.batch["token_level_rewards"] = stage3_batch.batch["token_level_scores"].clone()
+            metrics["selfplay/stage3_avg_reward"] = stage3_reward_scores.mean().item()
+
+        # ====== 详细日志: 用于手动验证reward正确性 ======
+        self._log_detailed_reward_debug(
+            n_prompts=n_prompts,
+            queries=queries,
+            answers=answers,
+            stage1_passed_rollouts=stage1_passed_rollouts,
+            stage1_rewards=stage1_rewards if stage1_batch is not None else None,
+            perturbed_data=perturbed_data,
+            passed_perturbations=passed_perturbations,
+            stage2_expected_answers=stage2_expected_answers,
+            stage2_responses=self._decode_responses(stage2_batch) if stage2_batch is not None else [],
+            stage2_reward_scores=stage2_reward_scores if stage2_batch is not None else None,
+            stage2_training_mask=stage2_training_mask if stage2_batch is not None else None,
+            group_has_correct=group_has_correct if stage2_batch is not None else [],
+            stage3_valid_map=stage3_valid_map if stage3_batch is not None else [],
+            paraphrased_questions=paraphrased_questions,
+            stage4_responses=self._decode_responses(stage4_batch) if stage4_batch is not None else [],
+            stage4_accuracies=stage4_accuracies,
+            stage4_reward_scores=stage4_reward_scores if stage4_batch is not None else None,
+            stage4_training_mask=stage4_training_mask if stage4_batch is not None else None,
+            stage3_reward_scores=stage3_reward_scores if (stage3_batch is not None and stage4_accuracies) else None,
+        )
+
+        stage_batches = [stage1_batch, stage2_batch, stage3_batch, stage4_batch]
         return stage_batches
+
+    def _log_detailed_reward_debug(self, **kwargs):
+        """输出详细的per-sample日志, 用于手动验证reward."""
+        sep = "─" * 80
+        print(f"\n{'═' * 80}")
+        print(f"  DETAILED REWARD DEBUG DUMP (手动验证用)")
+        print(f"{'═' * 80}")
+
+        n_prompts = kwargs["n_prompts"]
+        queries = kwargs["queries"]
+        answers = kwargs["answers"]
+        stage1_passed = kwargs["stage1_passed_rollouts"]
+        stage1_rewards = kwargs["stage1_rewards"]
+        perturbed_data = kwargs["perturbed_data"]
+        passed_perts = kwargs["passed_perturbations"]
+
+        # === Stage1 ===
+        print(f"\n{sep}")
+        print(f"  Stage1 REWARD (per-rollout)")
+        print(f"{sep}")
+        if stage1_rewards is not None:
+            for p_idx in range(n_prompts):
+                q_short = queries[p_idx][:60] + "..." if len(queries[p_idx]) > 60 else queries[p_idx]
+                print(f"  问题{p_idx}: {q_short}  (ans={answers[p_idx]})")
+                for r_idx in range(self.n1):
+                    flat_idx = p_idx * self.n1 + r_idx
+                    key = (p_idx, r_idx)
+                    verify = "✓" if key in stage1_passed else "✗"
+                    has_pert = key in perturbed_data
+                    has_evs = key in passed_perts and len(passed_perts[key]) > 0
+                    reward = stage1_rewards[flat_idx].item() if flat_idx < len(stage1_rewards) else 0
+                    n_evs_pass = len(passed_perts[key]) if key in passed_perts else 0
+                    print(f"    rollout{r_idx}: verify={verify}, has_pert={has_pert}, "
+                          f"evs_pass={n_evs_pass}, reward={reward:.0f}")
+
+        # === Stage2 ===
+        stage2_expected = kwargs["stage2_expected_answers"]
+        stage2_responses = kwargs["stage2_responses"]
+        stage2_scores = kwargs["stage2_reward_scores"]
+        stage2_mask = kwargs["stage2_training_mask"]
+        ghc = kwargs["group_has_correct"]
+
+        if stage2_scores is not None and len(stage2_expected) > 0:
+            print(f"\n{sep}")
+            print(f"  Stage2 REWARD + MASK (per-perturbation, n3={self.n3})")
+            print(f"{sep}")
+            from .auto_pipeline import extract_last_number_from_solution
+            for q_idx in range(len(stage2_expected)):
+                has_correct = ghc[q_idx] if q_idx < len(ghc) else False
+                mask_val = stage2_mask[q_idx * self.n3].item() if stage2_mask is not None else 1
+                print(f"  扰动{q_idx}: expected={stage2_expected[q_idx]}, "
+                      f"has_correct={'✓' if has_correct else '✗'}, mask={mask_val:.0f}")
+                for r_idx in range(self.n3):
+                    flat_idx = q_idx * self.n3 + r_idx
+                    if flat_idx < len(stage2_responses):
+                        resp_short = stage2_responses[flat_idx][:80].replace('\n', ' ')
+                        extracted = extract_last_number_from_solution(stage2_responses[flat_idx])
+                        reward = stage2_scores[flat_idx].item()
+                        print(f"    尝试{r_idx}: extracted={extracted}, reward={reward:.0f}, "
+                              f"resp=\"{resp_short}\"")
+
+        # === Stage3 + Stage4 ===
+        stage3_valid_map = kwargs["stage3_valid_map"]
+        paraphrased = kwargs["paraphrased_questions"]
+        stage4_responses = kwargs["stage4_responses"]
+        stage4_acc = kwargs["stage4_accuracies"]
+        stage4_scores = kwargs["stage4_reward_scores"]
+        stage4_mask = kwargs["stage4_training_mask"]
+        stage3_scores = kwargs["stage3_reward_scores"]
+
+        if stage4_scores is not None and len(paraphrased) > 0:
+            print(f"\n{sep}")
+            print(f"  Stage4 REWARD + MASK (per-paraphrase, n5={self.n5})")
+            print(f"{sep}")
+            from .auto_pipeline import extract_last_number_from_solution
+            for j in range(len(paraphrased)):
+                q_text, expected_ans = paraphrased[j]
+                acc = stage4_acc[j] if j < len(stage4_acc) else 0
+                mask_val = stage4_mask[j * self.n5].item() if stage4_mask is not None else 1
+                stage3_entry = stage3_valid_map[j] if j < len(stage3_valid_map) else "?"
+                q_short = q_text[:60].replace('\n', ' ')
+                print(f"  Stage4问题{j} (from stage3 entry {stage3_entry}): "
+                      f"expected={expected_ans}, acc={acc:.2f}, mask={mask_val:.0f}")
+                print(f"    paraphrase: \"{q_short}\"")
+                for r_idx in range(self.n5):
+                    flat_idx = j * self.n5 + r_idx
+                    if flat_idx < len(stage4_responses):
+                        extracted = extract_last_number_from_solution(stage4_responses[flat_idx])
+                        reward = stage4_scores[flat_idx].item()
+                        resp_short = stage4_responses[flat_idx][:80].replace('\n', ' ')
+                        print(f"    回答{r_idx}: extracted={extracted}, reward={reward:.0f}, "
+                              f"resp=\"{resp_short}\"")
+
+        if stage3_scores is not None:
+            print(f"\n{sep}")
+            print(f"  Stage3 REWARD (per-paraphrase-rollout)")
+            print(f"{sep}")
+            for i in range(len(stage3_scores)):
+                r = stage3_scores[i].item()
+                mapped = "空" if r == 0.0 and (i // self.n4, i % self.n4) not in dict(
+                    [(k, v) for v, k in enumerate(stage3_valid_map)] if stage3_valid_map else []
+                ) else f"{r:.4f}"
+                print(f"    stage3_batch[{i}]: reward={mapped}")
+
+        print(f"{'═' * 80}\n")
 
     def _compute_advantage_for_stage(
         self,
@@ -565,6 +793,22 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                 num_repeat=n_rollouts,
                 norm_adv_by_std_in_grpo=norm_adv_by_std,
             )
+
+        # 应用training_mask: 将被mask的样本的response_mask置0, 使其不参与参数更新
+        if "training_mask" in batch.batch:
+            training_mask_1d = batch.batch["training_mask"]  # (batch_size,)
+            # expand到与response_mask相同的seq_len维度
+            seq_len = batch.batch["response_mask"].shape[1]
+            training_mask = training_mask_1d.unsqueeze(1).expand(-1, seq_len)
+            batch.batch["response_mask"] = batch.batch["response_mask"] * training_mask
+            # 同时将masked样本的advantage置0
+            if "advantages" in batch.batch:
+                batch.batch["advantages"] = batch.batch["advantages"] * training_mask
+            masked_count = int((training_mask_1d == 0).sum().item())
+            logger.info(f"---ADV--- {stage_name}: training_mask排除了{masked_count}/{len(batch)}个样本")
+            print(f"---ADV--- {stage_name}: training_mask排除了{masked_count}/{len(batch)}个样本")
+            # 清理training_mask, 后续不再需要
+            batch.batch.pop("training_mask", None)
 
         return batch
 
@@ -723,9 +967,9 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                         )
 
                         # 为每个阶段计算advantage
-                        t1_batch, t2_batch, t3_batch, t4_batch = stage_batches
+                        stage1_batch, stage2_batch, stage3_batch, stage4_batch = stage_batches
                         n_rollouts_list = [self.n1, self.n3, self.n4, self.n5]
-                        names = ["T1", "T2", "T3", "T4"]
+                        names = ["Stage1", "Stage2", "Stage3", "Stage4"]
 
                         for idx, (batch, n_roll, name) in enumerate(
                             zip(stage_batches, n_rollouts_list, names)
@@ -745,7 +989,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                             timing_raw=timing_raw,
                         )
                     else:
-                        # ====== 标准GRPO模式 (T4-only) ======
+                        # ====== 标准GRPO模式 (Stage4-only) ======
                         self._run_standard_grpo(batch_dict, metrics, timing_raw)
 
                 # 验证

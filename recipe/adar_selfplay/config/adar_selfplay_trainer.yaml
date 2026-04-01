@@ -36,22 +36,24 @@ adar_selfplay:
   # 是否启用self-play模式 (False则退化为标准GRPO)
   enable_selfplay: False
 
-  # 可选阶段开关 (仅在enable_selfplay=True时生效)
-  enable_t2_evs: True           # 是否启用T2+EVS筛选
-  enable_t3_paraphrase: True    # 是否启用T3+paraphrase
+  # 可选: 关闭则只做Stage1, 不做Stage2 EVS筛选
+  enable_stage2_evs: True
+
+  # 可选: 关闭则只做Stage1+Stage2, 不做paraphrase和Stage4
+  enable_stage3_paraphrase: True
 
   # rollout次数
-  n1: 4    # T1: 模板+代码生成 (每个原始问题rollout的次数)
+  n1: 4    # Stage1: 模板+代码生成 (每个原始问题rollout的次数)
   n2: 5    # 扰动次数 (非模型, CPU执行)
-  n3: 8    # T2: 解答扰动题 (每个扰动问题rollout的次数)
-  n4: 4    # T3: paraphrase (每个问题rollout的次数)
-  n5: 8    # T4: 解答paraphrase题 (每个问题rollout的次数)
+  n3: 8    # Stage2: 解答扰动题 (每个扰动问题rollout的次数)
+  n4: 4    # Stage3: paraphrase (每个问题rollout的次数)
+  n5: 8    # Stage4: 解答paraphrase题 (每个问题rollout的次数)
 
   # loss权重 (4个阶段的loss加权系数)
-  w1: 0.2  # T1 loss权重
-  w2: 0.3  # T2 loss权重
-  w3: 0.2  # T3 loss权重
-  w4: 0.3  # T4 loss权重
+  w1: 0.2  # Stage1 loss权重
+  w2: 0.3  # Stage2 loss权重
+  w3: 0.2  # Stage3 loss权重
+  w4: 0.3  # Stage4 loss权重
 
   # 扰动参数
   perturb_alpha: 5              # 扰动幅度
@@ -59,6 +61,9 @@ adar_selfplay:
   code_timeout: 2.0             # 单次代码执行超时(秒)
 
   # 各阶段最大序列长度
-  max_template_code_length: 2048  # T1输出最大长度
-  max_solve_length: 2048          # T2,T4输出最大长度
-  max_paraphrase_length: 1024     # T3输出最大长度
+  max_template_code_length: 2048  # Stage1输出最大长度
+  max_solve_length: 2048          # Stage2,Stage4输出最大长度
+  max_paraphrase_length: 1024     # Stage3输出最大长度
+
+  # Debug: 注入假Stage1结果, 跳过parse_and_verify, 强制触发完整Stage2-Stage4 pipeline
+  debug_inject_stage1: False

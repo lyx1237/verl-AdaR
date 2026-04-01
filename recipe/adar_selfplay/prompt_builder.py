@@ -5,10 +5,10 @@ PromptBuilder (prompt_builder.py)
 并将文本prompt编码为verl的DataProto格式, 供generate_sequences()使用.
 
 4个阶段的prompt格式:
-- T1: 原始数学题 + "请提取模板和写解题代码" 的指令
-- T2: 扰动后的数学题 + "请解答" 的指令
-- T3: 通过EVS的题目 + "请改写这道题" 的指令
-- T4: paraphrase后的题目 + "请解答" 的指令
+- Stage1: 原始数学题 + "请提取模板和写解题代码" 的指令
+- Stage2: 扰动后的数学题 + "请解答" 的指令
+- Stage3: 通过EVS的题目 + "请改写这道题" 的指令
+- Stage4: paraphrase后的题目 + "请解答" 的指令
 """
 
 import uuid
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Prompt模板定义
 # ============================================================
 
-# T1: 模板+代码生成指令
+# Stage1: 模板+代码生成指令
 T1_INSTRUCTION = r"""Task Description:
 You are given a natural language query and its chain-of-thought response. Your task is to:
 Generate a Query Template by abstracting specific values into variables.
@@ -92,9 +92,10 @@ Instruction:
 
 """
 
-# T2/T4: 解答数学题的指令
+# Stage2/Stage4共用: 解答数学题的system prompt
 SOLVE_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
+# T2专用: 带代码提示的解答指令 (T4不使用代码提示, 仅用SOLVE_SYSTEM_PROMPT + 问题原文)
 SOLVE_WITH_CODE_PROMPT = r"""
 Your task is to provide a clear chain-of-thought (COT) explanation that answers the user's question. A Python script may be provided as part of the input, but it is not mandatory to follow it closely. If the provided code doesn't align with the real-world scenario or if the values and logic in the code are incorrect or irrelevant to the problem, feel free to disregard the script. Instead, focus on reasoning through the problem using your own judgment and logic.
 Interpret the question clearly and begin by understanding the problem. If the Python script can offer guidance, you may refer to it, but it's not a requirement. If the provided code does not match the context or contains errors, you are free to work through the solution from scratch without referring to it.
@@ -111,7 +112,7 @@ SOLVE_WITH_CODE_INSTRUCTION = """
 ### Response:
 """
 
-# T3: paraphrase指令
+# Stage3: paraphrase指令
 PARAPHRASE_PROMPT = """You are an AI assistant to help me rephrase questions. Follow the given examples.
 
 Question: Olivia has $23. She bought five bagels for $3 each. How much money does she have left?
@@ -280,7 +281,7 @@ class PromptBuilder:
     # 各阶段prompt构造
     # ============================================================
 
-    def build_t1_prompts(
+    def build_stage1_prompts(
         self,
         queries: list[str],
         responses: list[str],
@@ -305,10 +306,10 @@ class PromptBuilder:
 
         prompts = self._apply_chat_template(messages_list)
         result = self._encode_prompts(prompts, max_length=max_length)
-        logger.info(f"---PROMPT_BUILDER--- T1: 构造了 {len(queries)} 个模板+代码生成prompt")
+        logger.info(f"---PROMPT_BUILDER--- Stage1: 构造了 {len(queries)} 个模板+代码生成prompt")
         return result
 
-    def build_t2_prompts(
+    def build_stage2_prompts(
         self,
         queries: list[str],
         codes: list[str],
@@ -336,10 +337,10 @@ class PromptBuilder:
 
         prompts = self._apply_chat_template(messages_list)
         result = self._encode_prompts(prompts, max_length=max_length)
-        logger.info(f"---PROMPT_BUILDER--- T2: 构造了 {len(queries)} 个解答扰动问题prompt")
+        logger.info(f"---PROMPT_BUILDER--- Stage2: 构造了 {len(queries)} 个解答扰动问题prompt")
         return result
 
-    def build_t3_prompts(
+    def build_stage3_prompts(
         self,
         questions: list[str],
         max_length: int = None,
@@ -362,10 +363,10 @@ class PromptBuilder:
 
         prompts = self._apply_chat_template(messages_list)
         result = self._encode_prompts(prompts, max_length=max_length)
-        logger.info(f"---PROMPT_BUILDER--- T3: 构造了 {len(questions)} 个paraphrase prompt")
+        logger.info(f"---PROMPT_BUILDER--- Stage3: 构造了 {len(questions)} 个paraphrase prompt")
         return result
 
-    def build_t4_prompts(
+    def build_stage4_prompts(
         self,
         questions: list[str],
         max_length: int = None,
@@ -390,7 +391,7 @@ class PromptBuilder:
 
         prompts = self._apply_chat_template(messages_list)
         result = self._encode_prompts(prompts, max_length=max_length)
-        logger.info(f"---PROMPT_BUILDER--- T4: 构造了 {len(questions)} 个解答prompt")
+        logger.info(f"---PROMPT_BUILDER--- Stage4: 构造了 {len(questions)} 个解答prompt")
         return result
 
     def build_standard_solve_prompts(
@@ -400,6 +401,6 @@ class PromptBuilder:
     ) -> DataProto:
         """
         标准解题prompt (用于T4-only模式, 等同于标准GRPO训练).
-        与build_t4_prompts相同.
+        与build_stage4_prompts相同.
         """
-        return self.build_t4_prompts(questions, max_length=max_length)
+        return self.build_stage4_prompts(questions, max_length=max_length)

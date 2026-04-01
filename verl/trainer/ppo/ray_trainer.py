@@ -1076,6 +1076,25 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # Flatten multi-step agent trajectories into independent per-step samples
+                    # for on-policy training (e.g., WebArena multi-turn agent loop).
+                    # Each step becomes an independent sample with its own prompt/response/mask.
+                    # Must happen before reward/logprob computation since it rebuilds batch structure.
+                    if (
+                        self.config.trainer.get("flatten_multi_step_trajectories", False)
+                        and hasattr(batch, "non_tensor_batch")
+                        and "per_step_snapshots" in batch.non_tensor_batch
+                    ):
+                        from verl.trainer.ppo.flatten_steps import flatten_trajectories
+
+                        max_prompt_length = self.config.data.get("max_prompt_length", None)
+                        max_response_length = self.config.data.get("max_response_length", None)
+                        batch = flatten_trajectories(
+                            batch,
+                            max_prompt_length=max_prompt_length,
+                            max_response_length=max_response_length,
+                        )
+
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

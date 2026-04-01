@@ -11,25 +11,22 @@
 ### Self-Play版
 
 现在把外部的大模型(72B)替换为本地的小模型(~3B), 并且参与训练.
-1. 给定一个问题, 模型提取模板和解题代码, rollout n_1 次, 此次的输入输出记为 T1[In_1,Out_1]
+1. 给定一个问题, 模型提取模板和解题代码, rollout **n_1** 次, 此次的输入输出记为 **T1**[**In_1**,**Out_1**]
 2. 自动校验
-3. 自动扰动, rollout n_2次.
-4. 对扰动后的变体问题, 让本地小模型尝试解答, rollout n_3 次, 此次的输入输出记为 T2[In_2, Out_2], 只要有和代码运行结果一致的, 就接受该扰动
-5. 对通过的扰动做paraphrase, rollout n_4 次, 此次的输入输出记为 T3[In_3,Out_3]
-6. 小模型尝试对paraphrase的问题进行回答, rollout n_5 次, 此次输入输出记为 T4[In_4,Out_4]
-7. 计算reward, 记第6步某道题的正确率为acc, T4的reward= 1 if correct else 0, T3的reward=1-4*sqr(acc-0.5), 表示paraphrase适当的有点挑战性比较好. T2 的reward= 1 if correct else 0 , 但是如果不存在和代码运行一致的解答, 则舍弃这个批次, 不计算loss, 并且认为第一步的结果有误. T1的reward=1 if 步骤2,3,4均通过 else 0. 4个loss 都按照grpo的方式计算, token-mean-group-mean. 最后的总loss为4个loss带权相加, 权作为参数可设置.
+3. 自动扰动, rollout **n_2** 次.
+4. 对扰动后的变体问题, 让本地小模型尝试解答, rollout **n_3** 次, 此次的输入输出记为 **T2**[**In_2**, **Out_2**], 只要有和代码运行结果一致的, 就接受该扰动
+5. 对通过的扰动做paraphrase, rollout **n_4** 次, 此次的输入输出记为 **T3**[**In_3**,**Out_3**]
+6. 小模型尝试对paraphrase的问题进行回答, rollout **n_5** 次, 此次输入输出记为 **T4**[**In_4**,**Out_4**]
+7. 计算reward, 记第6步某道题的正确率为**acc**, **T4**的reward= **1 if correct else 0**, **T3**的reward=**1-4*sqr(acc-0.5)**, 表示paraphrase适当的有点挑战性比较好. **T2** 的reward= **1 if correct else 0** , 但是如果不存在和代码运行一致的解答, 则舍弃这个批次, 不计算loss, 并且认为扰动不成立. 如果所有的扰动均失败, 则认为第一步的模板和代码不正确. **T1**的reward=**1 if 步骤2,3,4均通过 else 0**. 4个loss 都按照grpo的方式计算, 最后的总loss为4个loss带权相加, 权作为参数可设置.
 
 ## 概述
 
 基于verl框架实现了Self-Play版AdaR训练pipeline。核心思路是在verl的RayPPOTrainer基础上，实现一个自定义的`RayAdaRSelfPlayTrainer`，在每个训练step中执行4阶段的self-play pipeline（T1→T2→T3→T4），共享同一个actor模型进行rollout和参数更新。
 
-支持两种模式:
-- **T4-only模式** (`enable_selfplay=False`): 退化为标准GRPO训练，已测试通过
-- **完整Self-Play模式** (`enable_selfplay=True`): 执行4阶段pipeline，待测试
 
 ## 新增文件
 
-### verl/recipe/adar_selfplay/ (verl框架侧, 6个新文件)
+### recipe/adar_selfplay/ (verl框架侧, 6个新文件)
 
 | 文件 | 说明 |
 |------|------|

@@ -185,15 +185,8 @@ class TaskRunner:
         )
 
         # 注册AdaR reward函数 (monkey-patch)
-        try:
-            import sys
-            # 尝试导入AdaR项目的reward函数
-            # 用户需要确保AdaR/scripts在Python path中
-            from reward_func import register_adar_reward
-            register_adar_reward()
-        except ImportError:
-            print("---INIT--- 未找到AdaR reward_func, 使用verl默认reward函数")
-            print("---INIT--- 如需使用AdaR reward, 请将AdaR/scripts加入PYTHONPATH")
+        from .reward_func import register_adar_reward
+        register_adar_reward()
 
         # 创建trainer
         trainer = RayAdaRSelfPlayTrainer(

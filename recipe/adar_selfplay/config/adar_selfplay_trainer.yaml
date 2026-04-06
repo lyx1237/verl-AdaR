@@ -13,7 +13,7 @@ data:
   gen_batch_size: ${data.train_batch_size}
 
 reward_model:
-  reward_manager: naive
+  reward_manager: dapo
   overlong_buffer:
     enable: False
     len: 0
@@ -23,9 +23,15 @@ reward_model:
 algorithm:
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig
-    enable: False
-    metric: null
-    max_num_gen_batches: 0
+    enable: True
+    metric: acc
+    max_num_gen_batches: 10
+
+actor_rollout_ref:
+  actor:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    loss_agg_mode: "token-mean"
 
 trainer:
   project_name: AdaR-SelfPlay
@@ -52,8 +58,14 @@ adar_selfplay:
   # loss权重 (4个阶段的loss加权系数)
   w1: 0.2  # Stage1 loss权重
   w2: 0.3  # Stage2 loss权重
-  w3: 0.2  # Stage3 loss权重
+  w3: 0.0  # Stage3 loss权重 (暂时设为0, Stage3奖励暂不参与)
   w4: 0.3  # Stage4 loss权重
+
+  # Stage1 部分奖励参数
+  stage1_r1: 0.2   # VA(变量对齐)通过奖励
+  stage1_r2: 0.3   # EC(代码执行+答案验证)通过奖励
+  stage1_r3: 0.2   # EVS(至少一个扰动通过)通过奖励
+  stage1_r4_mode: 1  # r4计算模式: 1=过滤版(舍弃全错组), 2=直接版(所有组)
 
   # 扰动参数
   perturb_alpha: 5              # 扰动幅度
@@ -64,6 +76,22 @@ adar_selfplay:
   max_template_code_length: 2048  # Stage1输出最大长度
   max_solve_length: 2048          # Stage2,Stage4输出最大长度
   max_paraphrase_length: 1024     # Stage3输出最大长度
+
+  # 逐阶段 self-play 开关 (True=本地模型rollout, False=API rollout)
+  # 仅在 enable_selfplay=True 时生效
+  selfplay_stage1: True
+  selfplay_stage2: True
+  selfplay_stage3: True
+  selfplay_stage4: True
+
+  # API rollout 配置 (当某阶段 selfplay=False 时生效)
+  api_rollout:
+    endpoint: "http://localhost:8000/v1/chat/completions"
+    model: "qwen3-4b"
+    timeout: 120
+    max_retries: 3
+    max_concurrent: 64
+    temperature: 1.0
 
   # Debug: 注入假Stage1结果, 跳过parse_and_verify, 强制触发完整Stage2-Stage4 pipeline
   debug_inject_stage1: False

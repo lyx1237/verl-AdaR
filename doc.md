@@ -31,7 +31,8 @@
 | 文件 | 说明 |
 |------|------|
 | `__init__.py` | 包初始化 |
-| `auto_pipeline.py` | 核心pipeline逻辑，从scripts/adar重构而来 |
+| `auto_pipeline.py` | 核心pipeline逻辑，`parse_and_verify`支持`return_detail`暴露VA/EC状态 |
+| `api_rollout.py` | API异步rollout客户端 (aiohttp), 逐阶段selfplay关闭时使用 |
 | `prompt_builder.py` | 各阶段prompt构造 + DataProto编码 |
 | `adar_selfplay_reward.py` | 4阶段reward计算函数 |
 | `adar_selfplay_ray_trainer.py` | 自定义trainer，继承RayPPOTrainer |
@@ -46,6 +47,7 @@
 | `test_adar_selfplay_0.5b_20260330.sh` | T4-only模式测试脚本 (已通过) |
 | `test_adar_selfplay_full_0.5b_20260330.sh` | 0.5B完整测试 (已通过) |
 | `test_adar_selfplay_qwen3_4b_20260330.sh` | Qwen3-4B完整测试(已通过) |
+| `test_modify0402_0.5b_20260402.sh` | DAPO+部分奖励+逐阶段开关测试 (已通过) |
 
 ## 各文件详细说明
 
@@ -78,32 +80,43 @@
 
 | 阶段 | 函数 | Reward公式 |
 |------|------|------------|
-| T1 | `compute_t1_reward()` | 二元: verify+perturb+evs全部通过=1, 否则=0 |
-| T2 | `compute_t2_reward()` | 二元: 答案正确=1, 否则=0 |
-| T3 | `compute_t3_reward()` | `1 - 4*(acc-0.5)^2`, acc为T4解答准确率, 鼓励中等难度 |
-| T4 | `compute_t4_reward()` | 二元: 答案正确=1, 否则=0 |
+| T1 | `compute_stage1_reward()` | 部分奖励: r1(VA) + r2(EC) + r3(EVS) + r4(Stage4 acc), 见下方详细说明 |
+| T2 | `compute_stage2_reward()` | 二元: 答案正确=1, 否则=0 |
+| T3 | `compute_stage3_reward()` | `1 - 4*(acc-0.5)^2`, acc为T4解答准确率, 鼓励中等难度 (当前w3=0, 暂不参与训练) |
+| T4 | `compute_stage4_reward()` | 二元: 答案正确=1, 否则=0 |
+
+**Stage1 部分奖励 (0402更新):**
+- r1: VA(变量对齐)通过 → `stage1_r1` (默认0.2)
+- r2: EC(代码执行+答案验证)通过 → `stage1_r2` (默认0.3)
+- r3: EVS(至少一个扰动通过)通过 → `stage1_r3` (默认0.2)
+- r4: `(1-r1-r2-r3) * (1-(acc-0.5)^2)`, acc为该rollout衍生的Stage4平均正确率
+- 支持 `r4_mode=1` (过滤全错组后平均) 和 `r4_mode=2` (直接平均)
+
+**DAPO Dynamic Sampling (0402更新):**
+所有阶段的reward函数返回`training_mask`, 过滤reward std==0的group (全对和全错), 不参与参数更新。
 
 ### 4. `adar_selfplay_ray_trainer.py` — 自定义Trainer
 
 **`RayAdaRSelfPlayTrainer(RayPPOTrainer)`**:
 
 核心方法:
-- `fit()`: 主训练循环，根据`enable_selfplay`配置选择模式
+- `fit()`: 主训练循环 (必须 `enable_selfplay=True`, 否则请用verl默认trainer)
 - `_run_selfplay_pipeline()`: 完整4阶段pipeline
-  1. T1: generate → parse_and_verify → perturb → evs筛选
-  2. T2: generate解答扰动题 → 计算reward
+  1. T1: generate → parse_and_verify(暴露VA/EC状态) → perturb → evs筛选
+  2. T2: generate解答扰动题 → 计算reward + dynamic sampling mask
   3. T3: generate paraphrase → T4解答 → 计算T3 reward
-  4. T4: 计算T4 reward
+  4. T4: 计算T4 reward + dynamic sampling mask → Stage4 acc回传给T1
   5. 合并4阶段batch，加权advantages，更新actor
-- `_run_standard_grpo()`: T4-only标准GRPO
-- `_generate_for_stage()`: 通用rollout接口
-- `_compute_advantage_for_stage()`: GRPO advantage = (reward - mean) / std
+- `_generate_for_stage()`: 通用rollout接口，支持 `use_api=True` 调用外部API
+- `_api_generate()`: API rollout, 解码prompt→异步调用→tokenize response→构造DataProto
+- `_compute_advantage_for_stage()`: GRPO advantage + 应用training_mask (dynamic sampling)
 - `_merge_and_update()`: 合并多阶段DataProto，按权重缩放advantage
 
 可配置开关:
-- `enable_selfplay`: 是否启用self-play (False退化为标准GRPO)
-- `enable_t2_evs`: 是否启用T2+EVS筛选阶段
-- `enable_t3_paraphrase`: 是否启用T3+paraphrase阶段
+- `enable_selfplay`: 必须为True (不需要selfplay时请用verl默认trainer)
+- `enable_stage2_evs`: 是否启用T2+EVS筛选阶段
+- `enable_stage3_paraphrase`: 是否启用T3+paraphrase阶段
+- `selfplay_stage1~4`: 逐阶段self-play开关 (False时用API rollout替代本地模型)
 
 ### 5. `run_adar_selfplay.py` — 入口脚本
 
@@ -114,8 +127,12 @@
 ### 6. `config/adar_selfplay_trainer.yaml` — 配置
 
 继承verl的`ppo_trainer`默认配置，添加`adar_selfplay`专有配置:
+- 算法: DAPO (token-mean loss, 非对称clipping, dynamic sampling filter_groups)
 - rollout次数: n1=4, n2=5, n3=8, n4=4, n5=8
-- loss权重: w1=0.2, w2=0.3, w3=0.2, w4=0.3
+- loss权重: w1=0.2, w2=0.3, w3=0.0(暂时), w4=0.3
+- Stage1部分奖励: r1=0.2, r2=0.3, r3=0.2, r4_mode=1
+- 逐阶段self-play开关: selfplay_stage1~4 (默认True)
+- API rollout配置: endpoint, model, timeout, max_concurrent等
 - 扰动参数: alpha=5, timeout=30s, code_timeout=2s
 - 序列长度: template_code=2048, solve=2048, paraphrase=1024
 
@@ -126,7 +143,15 @@
 - `reward_model`: `{style: "rule", ground_truth: answer}`
 - `extra_info`: `{id, query, chosen, answer}` — self-play pipeline需要的原始数据
 
-## 未修改的文件
+## 修改的verl框架文件
 
-本次实现完全基于增量新增文件，未修改verl框架或AdaR项目中的任何现有文件。
+| 文件 | 修改内容 |
+|------|----------|
+| `verl/workers/reward_manager/dapo.py` | 修复 `overlong_buffer_cfg` null check bug |
+
+## 附加文档
+
+| 文件 | 说明 |
+|------|------|
+| `docs/adar/dapo_token_level_loss.md` | DAPO token-level PG loss 实现说明, verl实现与论文公式的区别分析 |
 

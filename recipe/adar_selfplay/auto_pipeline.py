@@ -216,6 +216,7 @@ def parse_and_verify(
     answer: str,
     executor: SafeExecutor,
     code_timeout: float = 2.0,
+    return_detail: bool = False,
 ) -> Optional[dict]:
     """
     从模型的一次生成结果中解析模板和Python代码, 并验证正确性.
@@ -226,11 +227,22 @@ def parse_and_verify(
         answer: 原始答案
         executor: SafeExecutor实例
         code_timeout: 代码执行超时(秒)
+        return_detail: 是否返回详细的中间检测结果 (VA/EC状态)
 
     Returns:
-        成功返回 {"template": str, "python": str, "answer": answer}
-        失败返回 None
+        return_detail=False (默认):
+            成功返回 {"template": str, "python": str, "answer": answer}
+            失败返回 None
+        return_detail=True:
+            总是返回 {"va_passed": bool, "ec_passed": bool, "result": dict|None}
+            result为None表示最终未通过, 否则包含 template/python/answer
     """
+    va_passed = False
+    ec_passed = False
+
+    # 剥离<think>...</think>内容 (Qwen3 thinking模式)
+    generation = re.sub(r'<think>.*?</think>', '', generation, flags=re.DOTALL).strip()
+
     # 提取模板
     template_match = re.search(
         r'### (?:Query|Query Template|Template):(.*?)(?=###|$)',
@@ -247,42 +259,58 @@ def parse_and_verify(
 
     if python_code is None:
         logger.debug("---PARSE--- FAIL: 无法提取Python代码")
+        if return_detail:
+            return {"va_passed": False, "ec_passed": False, "result": None}
         return None
     if template_content is None:
         logger.debug("---PARSE--- FAIL: 无法提取模板")
+        if return_detail:
+            return {"va_passed": False, "ec_passed": False, "result": None}
         return None
 
     # 检查模板与原始问题的相似度 (空格数差异不超过50%)
     if abs(template_content.count(' ') - query.count(' ')) > 0.5 * min(query.count(' ') + 1, template_content.count(' ') + 1):
         logger.debug("---PARSE--- FAIL: 模板与原始问题不匹配")
+        if return_detail:
+            return {"va_passed": False, "ec_passed": False, "result": None}
         return None
 
-    # 执行代码
-    python_result = executor.run_as_number(python_code, timeout=code_timeout)
-    if python_result is None:
-        logger.debug("---PARSE--- FAIL: 代码运行错误/超时")
-        return None
-
-    # 检查执行结果与答案是否一致
-    expected = extract_last_num(answer)
-    if abs(python_result - expected) > 1e-2:
-        logger.debug(f"---PARSE--- FAIL: 代码结果={python_result}, 答案={expected}")
-        return None
-
-    # 检查模板变量与代码变量是否对齐
+    # VA检测: 检查模板变量与代码变量是否对齐
     variables = re.findall(r'<([^>]+?)>', template_content)
     for var in variables:
         pattern = r'\b' + re.escape(var) + r'\s*?='
         if re.search(pattern, python_code) is None:
             logger.debug(f"---PARSE--- FAIL: 变量'{var}'在代码中未找到定义")
+            if return_detail:
+                return {"va_passed": False, "ec_passed": False, "result": None}
             return None
+    va_passed = True
+
+    # EC检测: 执行代码并检查结果
+    python_result = executor.run_as_number(python_code, timeout=code_timeout)
+    if python_result is None:
+        logger.debug("---PARSE--- FAIL: 代码运行错误/超时")
+        if return_detail:
+            return {"va_passed": True, "ec_passed": False, "result": None}
+        return None
+
+    expected = extract_last_num(answer)
+    if abs(python_result - expected) > 1e-2:
+        logger.debug(f"---PARSE--- FAIL: 代码结果={python_result}, 答案={expected}")
+        if return_detail:
+            return {"va_passed": True, "ec_passed": False, "result": None}
+        return None
+    ec_passed = True
 
     logger.debug(f"---PARSE--- SUCCESS: 模板变量={variables}")
-    return {
+    result = {
         "template": template_content,
         "python": python_code,
         "answer": answer,
     }
+    if return_detail:
+        return {"va_passed": True, "ec_passed": True, "result": result}
+    return result
 
 
 # ============================================================

@@ -10,15 +10,14 @@ RayAdaRSelfPlayTrainer (adar_selfplay_ray_trainer.py)
   Stage4: 解答paraphrase后的问题 → 计算reward
 
 阶段启用控制 (通过配置):
-  - enable_selfplay=False时, 只运行T4 (等同于标准GRPO)
-  - enable_selfplay=True时, 运行全部Stage1~Stage4
+  - enable_selfplay=True时, 运行全部Stage1~Stage4 (使用DAPO算法)
   - enable_stage3_paraphrase 控制是否启用Stage3+Stage4 (关闭则只做Stage1+Stage2)
+  - 各阶段可独立开关selfplay (selfplay_stageX=False则用API rollout)
 
 所有阶段共享同一个actor模型, 4个阶段的loss按权重加权后一起更新.
 """
 
 import os
-import uuid
 import logging
 from collections import defaultdict
 from copy import deepcopy
@@ -29,7 +28,6 @@ import torch
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
@@ -38,7 +36,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
-from verl.trainer.ppo.reward import compute_reward
 from verl.utils.metric import reduce_metrics
 from verl.utils.debug import marked_timer
 
@@ -87,8 +84,14 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         # loss权重
         self.w1 = sp_cfg.get("w1", 0.2)  # Stage1 loss权重
         self.w2 = sp_cfg.get("w2", 0.3)  # Stage2 loss权重
-        self.w3 = sp_cfg.get("w3", 0.2)  # Stage3 loss权重
+        self.w3 = sp_cfg.get("w3", 0.0)  # Stage3 loss权重 (默认0, 暂不参与)
         self.w4 = sp_cfg.get("w4", 0.3)  # Stage4 loss权重
+
+        # Stage1 部分奖励参数
+        self.stage1_r1 = sp_cfg.get("stage1_r1", 0.2)  # VA通过奖励
+        self.stage1_r2 = sp_cfg.get("stage1_r2", 0.3)  # EC通过奖励
+        self.stage1_r3 = sp_cfg.get("stage1_r3", 0.2)  # EVS通过奖励
+        self.stage1_r4_mode = sp_cfg.get("stage1_r4_mode", 1)  # r4计算模式
 
         # 扰动参数
         self.perturb_alpha = sp_cfg.get("perturb_alpha", 5)
@@ -99,6 +102,21 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         self.max_template_code_length = sp_cfg.get("max_template_code_length", 2048)
         self.max_solve_length = sp_cfg.get("max_solve_length", 2048)
         self.max_paraphrase_length = sp_cfg.get("max_paraphrase_length", 1024)
+
+        # 逐阶段 self-play 开关
+        self.selfplay_stage1 = sp_cfg.get("selfplay_stage1", True)
+        self.selfplay_stage2 = sp_cfg.get("selfplay_stage2", True)
+        self.selfplay_stage3 = sp_cfg.get("selfplay_stage3", True)
+        self.selfplay_stage4 = sp_cfg.get("selfplay_stage4", True)
+
+        # API rollout 配置
+        api_cfg = sp_cfg.get("api_rollout", {})
+        self.api_endpoint = api_cfg.get("endpoint", "http://localhost:8000/v1/chat/completions")
+        self.api_model = api_cfg.get("model", "qwen3-4b")
+        self.api_timeout = api_cfg.get("timeout", 120)
+        self.api_max_retries = api_cfg.get("max_retries", 3)
+        self.api_max_concurrent = api_cfg.get("max_concurrent", 64)
+        self.api_temperature = api_cfg.get("temperature", 1.0)
 
         # Debug: 注入假的T1通过结果, 用于测试完整pipeline
         self.debug_inject_stage1 = sp_cfg.get("debug_inject_stage1", False)
@@ -112,6 +130,11 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             logger.info(f"---SELFPLAY--- T3_Paraphrase: {self.enable_stage3_paraphrase}")
             logger.info(f"---SELFPLAY--- rollout次数: n1={self.n1}, n2={self.n2}, n3={self.n3}, n4={self.n4}, n5={self.n5}")
             logger.info(f"---SELFPLAY--- loss权重: w1={self.w1}, w2={self.w2}, w3={self.w3}, w4={self.w4}")
+            logger.info(f"---SELFPLAY--- Stage1奖励: r1={self.stage1_r1}, r2={self.stage1_r2}, r3={self.stage1_r3}, r4_mode={self.stage1_r4_mode}")
+            logger.info(f"---SELFPLAY--- 逐阶段self-play: S1={self.selfplay_stage1}, S2={self.selfplay_stage2}, "
+                        f"S3={self.selfplay_stage3}, S4={self.selfplay_stage4}")
+            if not all([self.selfplay_stage1, self.selfplay_stage2, self.selfplay_stage3, self.selfplay_stage4]):
+                logger.info(f"---SELFPLAY--- API rollout: endpoint={self.api_endpoint}, model={self.api_model}")
         print(f"---SELFPLAY--- 模式: {mode_str}")
 
     def _decode_responses(self, batch: DataProto) -> list[str]:
@@ -207,6 +230,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         n_rollouts: int,
         stage_name: str,
         timing_raw: dict,
+        use_api: bool = False,
     ) -> DataProto:
         """
         为某个阶段调用generate_sequences, 并返回生成结果.
@@ -216,32 +240,159 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             n_rollouts: 每个prompt的rollout次数
             stage_name: 阶段名称, 用于日志
             timing_raw: 计时字典
+            use_api: 是否使用API rollout (而非本地模型)
 
         Returns:
             包含生成结果的DataProto (已repeat+union)
         """
-        logger.info(f"---{stage_name}--- 开始生成, batch_size={len(prompt_batch)}, n={n_rollouts}")
-        print(f"---{stage_name}--- 开始生成, batch_size={len(prompt_batch)}, n={n_rollouts}")
+        logger.info(f"---{stage_name}--- 开始生成, batch_size={len(prompt_batch)}, n={n_rollouts}, "
+                    f"mode={'API' if use_api else 'Local'}")
+        print(f"---{stage_name}--- 开始生成, batch_size={len(prompt_batch)}, n={n_rollouts}, "
+              f"mode={'API' if use_api else 'Local'}")
 
         # repeat prompt以匹配rollout次数
         gen_input = prompt_batch.repeat(repeat_times=n_rollouts, interleave=True)
 
-        with marked_timer(f"gen_{stage_name}", timing_raw, color="red"):
-            gen_output = self.actor_rollout_wg.generate_sequences(gen_input)
-            if "timing" in gen_output.meta_info:
-                timing_raw.update(gen_output.meta_info["timing"])
-                gen_output.meta_info.pop("timing", None)
+        # 显式pad到n_gpus的倍数, 避免dispatch chunk时不整除
+        n_gpus = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        original_size = len(gen_input)
+        remainder = original_size % n_gpus
+        if remainder != 0:
+            pad_size = n_gpus - remainder
+            gen_input.padding(padding_size=pad_size)
+            print(f"---{stage_name}--- Padding gen_input: {original_size} -> {len(gen_input)} (n_gpus={n_gpus})")
 
-        # gen_output包含完整的input_ids(prompt+response), attention_mask, position_ids等
-        # 将gen_input的non_tensor_batch合并到gen_output (不包含tensor, 避免input_ids冲突)
-        result = gen_output
-        for key in gen_input.non_tensor_batch:
-            if key not in result.non_tensor_batch:
-                result.non_tensor_batch[key] = gen_input.non_tensor_batch[key]
+        if use_api:
+            # API rollout: 解码prompt → API调用 → tokenize response → 构造DataProto
+            with marked_timer(f"gen_{stage_name}_api", timing_raw, color="magenta"):
+                result = self._api_generate(gen_input, stage_name)
+        else:
+            # 本地模型rollout
+            with marked_timer(f"gen_{stage_name}", timing_raw, color="red"):
+                gen_output = self.actor_rollout_wg.generate_sequences(gen_input)
+                if "timing" in gen_output.meta_info:
+                    timing_raw.update(gen_output.meta_info["timing"])
+                    gen_output.meta_info.pop("timing", None)
+
+            # gen_output包含完整的input_ids(prompt+response), attention_mask, position_ids等
+            # 将gen_input的non_tensor_batch合并到gen_output (不包含tensor, 避免input_ids冲突)
+            result = gen_output
+            for key in gen_input.non_tensor_batch:
+                if key not in result.non_tensor_batch:
+                    result.non_tensor_batch[key] = gen_input.non_tensor_batch[key]
+
+        # trim回原始大小, 去掉padding的样本
+        if len(result) > original_size:
+            result = result[:original_size]
 
         logger.info(f"---{stage_name}--- 生成完成, 总responses={len(result)}")
         print(f"---{stage_name}--- 生成完成, 总responses={len(result)}")
 
+        return result
+
+    def _api_generate(self, gen_input: DataProto, stage_name: str) -> DataProto:
+        """
+        使用API rollout生成response, 并构造与本地rollout格式兼容的DataProto.
+
+        API生成的response不会有log_prob等信息, 只有token ids和mask.
+        这些样本在后续的advantage计算和actor更新中将被正常处理.
+        """
+        from .api_rollout import api_generate_batch
+
+        # 解码prompt文本
+        prompts_text = []
+        prompt_lengths = []
+        for i in range(len(gen_input)):
+            input_ids = gen_input.batch["input_ids"][i]
+            attention_mask = gen_input.batch["attention_mask"][i]
+            valid_len = attention_mask.sum().item()
+            valid_ids = input_ids[-int(valid_len):]
+            text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+            prompts_text.append(text)
+            prompt_lengths.append(int(valid_len))
+
+        # 获取max response length
+        max_response_len = self.config.data.get("max_response_length", 2048)
+
+        # 调用API
+        responses_text = api_generate_batch(
+            prompts=prompts_text,
+            endpoint=self.api_endpoint,
+            model=self.api_model,
+            max_tokens=max_response_len,
+            temperature=self.api_temperature,
+            timeout=self.api_timeout,
+            max_retries=self.api_max_retries,
+            max_concurrent=self.api_max_concurrent,
+        )
+
+        # Tokenize responses并构造DataProto
+        batch_size = len(gen_input)
+        prompt_max_len = gen_input.batch["input_ids"].shape[1]
+
+        # tokenize所有response
+        response_ids_list = []
+        for resp_text in responses_text:
+            if not resp_text:
+                resp_text = " "  # 确保非空
+            ids = self.tokenizer.encode(resp_text, add_special_tokens=False)
+            if len(ids) > max_response_len:
+                ids = ids[:max_response_len]
+            response_ids_list.append(ids)
+
+        # 计算response最大长度
+        max_resp_len = max(len(ids) for ids in response_ids_list)
+        seq_len = prompt_max_len + max_resp_len
+
+        # 构造tensor
+        all_input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        all_attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        all_position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        all_responses = torch.zeros(batch_size, max_resp_len, dtype=torch.long)
+
+        pad_token_id = self.tokenizer.pad_token_id or 0
+
+        for i in range(batch_size):
+            # prompt部分
+            prompt_ids = gen_input.batch["input_ids"][i]  # (prompt_max_len,)
+            prompt_mask = gen_input.batch["attention_mask"][i]
+
+            # response部分
+            resp_ids = response_ids_list[i]
+            resp_len = len(resp_ids)
+
+            # 拼接 prompt + response
+            all_input_ids[i, :prompt_max_len] = prompt_ids
+            all_input_ids[i, prompt_max_len:prompt_max_len + resp_len] = torch.tensor(resp_ids, dtype=torch.long)
+
+            # attention mask
+            all_attention_mask[i, :prompt_max_len] = prompt_mask
+            all_attention_mask[i, prompt_max_len:prompt_max_len + resp_len] = 1
+
+            # position ids
+            valid_positions = all_attention_mask[i].sum().item()
+            all_position_ids[i, :int(valid_positions)] = torch.arange(int(valid_positions))
+
+            # responses (只有response部分)
+            all_responses[i, :resp_len] = torch.tensor(resp_ids, dtype=torch.long)
+
+        # 构造DataProto
+        result = DataProto.from_dict(
+            tensors={
+                "input_ids": all_input_ids,
+                "attention_mask": all_attention_mask,
+                "position_ids": all_position_ids,
+                "responses": all_responses,
+                "prompts": gen_input.batch["input_ids"].clone(),
+            },
+        )
+
+        # 复制non_tensor_batch
+        for key in gen_input.non_tensor_batch:
+            result.non_tensor_batch[key] = gen_input.non_tensor_batch[key]
+
+        logger.info(f"---API_ROLLOUT--- {stage_name}: 构造DataProto完成, "
+                    f"seq_len={seq_len}, max_resp_len={max_resp_len}")
         return result
 
     def _run_selfplay_pipeline(
@@ -303,6 +454,9 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         stage1_batch = None
         # (p_idx, r_idx) -> {"template": ..., "python": ...} 通过parse_and_verify的rollout
         stage1_passed_rollouts = {}
+        # VA/EC中间状态记录 (用于部分奖励)
+        stage1_va_passed = {}  # {(p_idx, r_idx): True}
+        stage1_ec_passed = {}  # {(p_idx, r_idx): True}
 
         with marked_timer("stage1", timing_raw, color="blue"):
             logger.info("---STAGE1--- Stage1: 生成模板和代码")
@@ -315,16 +469,33 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             )
 
             stage1_batch = self._generate_for_stage(
-                stage1_prompt_batch, self.n1, "Stage1", timing_raw
+                stage1_prompt_batch, self.n1, "Stage1", timing_raw,
+                use_api=not self.selfplay_stage1,
             )
 
             stage1_responses = self._decode_responses(stage1_batch)
+
+            # 打印Stage1模型完整输出
+            print(f"\n{'='*80}")
+            print(f"---STAGE1_OUTPUT--- Stage1模型输出 (共{len(stage1_responses)}条)")
+            print(f"{'='*80}")
+            for _s1_idx, _s1_resp in enumerate(stage1_responses):
+                _s1_p_idx = _s1_idx // self.n1
+                _s1_r_idx = _s1_idx % self.n1
+                _s1_q_short = queries[_s1_p_idx][:80].replace('\n', ' ') if _s1_p_idx < len(queries) else "?"
+                print(f"---STAGE1_OUTPUT--- [问题{_s1_p_idx}/rollout{_s1_r_idx}] query: {_s1_q_short}")
+                print(f"---STAGE1_OUTPUT--- [问题{_s1_p_idx}/rollout{_s1_r_idx}] response:\n{_s1_resp}")
+                print(f"---STAGE1_OUTPUT--- {'─'*60}")
 
             # 对每个rollout独立检查parse_and_verify
             if self.debug_inject_stage1:
                 # DEBUG模式: 注入假T1结果
                 # rollout 0 对所有问题都通过, rollout 1 只对偶数问题通过
                 stage1_passed_rollouts = self._debug_make_fake_t1(queries, answers, n_prompts)
+                # debug模式下VA/EC全部标记为通过
+                for key in stage1_passed_rollouts:
+                    stage1_va_passed[key] = True
+                    stage1_ec_passed[key] = True
                 print(f"---DEBUG--- 注入假T1结果: {len(stage1_passed_rollouts)} rollouts通过")
             else:
                 for p_idx in range(n_prompts):
@@ -332,26 +503,36 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                         flat_idx = p_idx * self.n1 + r_idx
                         if flat_idx >= len(stage1_responses):
                             break
-                        result = parse_and_verify(
+                        detail = parse_and_verify(
                             generation=stage1_responses[flat_idx],
                             query=queries[p_idx],
                             answer=answers[p_idx],
                             executor=self.executor,
                             code_timeout=self.code_timeout,
+                            return_detail=True,
                         )
-                        if result is not None:
-                            stage1_passed_rollouts[(p_idx, r_idx)] = {
-                                "template": result["template"],
-                                "python": result["python"],
+                        key = (p_idx, r_idx)
+                        if detail["va_passed"]:
+                            stage1_va_passed[key] = True
+                        if detail["ec_passed"]:
+                            stage1_ec_passed[key] = True
+                        if detail["result"] is not None:
+                            stage1_passed_rollouts[key] = {
+                                "template": detail["result"]["template"],
+                                "python": detail["result"]["python"],
                             }
 
             k1 = len(stage1_passed_rollouts)
             n_prompts_with_pass = len(set(k[0] for k in stage1_passed_rollouts))
             logger.info(f"---STAGE1--- Stage1校验通过: {k1}/{n_prompts * self.n1} rollouts "
-                        f"(来自 {n_prompts_with_pass}/{n_prompts} 个问题)")
-            print(f"---STAGE1--- Stage1校验通过: {k1}/{n_prompts * self.n1} rollouts")
+                        f"(来自 {n_prompts_with_pass}/{n_prompts} 个问题), "
+                        f"VA通过: {len(stage1_va_passed)}, EC通过: {len(stage1_ec_passed)}")
+            print(f"---STAGE1--- Stage1校验通过: {k1}/{n_prompts * self.n1} rollouts "
+                  f"(VA: {len(stage1_va_passed)}, EC: {len(stage1_ec_passed)})")
             metrics["selfplay/stage1_verify_pass_rate"] = k1 / max(n_prompts * self.n1, 1)
             metrics["selfplay/stage1_verify_prompt_rate"] = n_prompts_with_pass / max(n_prompts, 1)
+            metrics["selfplay/stage1_va_pass_rate"] = len(stage1_va_passed) / max(n_prompts * self.n1, 1)
+            metrics["selfplay/stage1_ec_pass_rate"] = len(stage1_ec_passed) / max(n_prompts * self.n1, 1)
 
         # ====== Stage 1.5: 自动扰动 (对每个通过的Stage1 rollout分别扰动) ======
         # (p_idx, r_idx) -> list of perturbation dicts
@@ -410,11 +591,26 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                     )
 
                     stage2_batch = self._generate_for_stage(
-                        stage2_prompt_batch, self.n3, "Stage2", timing_raw
+                        stage2_prompt_batch, self.n3, "Stage2", timing_raw,
+                        use_api=not self.selfplay_stage2,
                     )
 
                     # EVS筛选: 对每个扰动问题, 检查n3个回答中是否有正确的
                     stage2_responses = self._decode_responses(stage2_batch)
+
+                    # 打印Stage2模型完整输出
+                    print(f"\n{'='*80}")
+                    print(f"---STAGE2_OUTPUT--- Stage2模型输出 (共{len(stage2_responses)}条)")
+                    print(f"{'='*80}")
+                    for _s2_idx, _s2_resp in enumerate(stage2_responses):
+                        _s2_q_idx = _s2_idx // self.n3
+                        _s2_r_idx = _s2_idx % self.n3
+                        _s2_q_short = stage2_queries[_s2_q_idx][:80].replace('\n', ' ') if _s2_q_idx < len(stage2_queries) else "?"
+                        _s2_exp = stage2_expected_answers[_s2_q_idx] if _s2_q_idx < len(stage2_expected_answers) else "?"
+                        print(f"---STAGE2_OUTPUT--- [扰动{_s2_q_idx}/尝试{_s2_r_idx}] query: {_s2_q_short}")
+                        print(f"---STAGE2_OUTPUT--- [扰动{_s2_q_idx}/尝试{_s2_r_idx}] expected: {_s2_exp}")
+                        print(f"---STAGE2_OUTPUT--- [扰动{_s2_q_idx}/尝试{_s2_r_idx}] response:\n{_s2_resp}")
+                        print(f"---STAGE2_OUTPUT--- {'─'*60}")
 
                     for q_idx in range(len(stage2_queries)):
                         responses_for_q = []
@@ -450,6 +646,8 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         stage3_batch = None
         paraphrased_questions = []  # list of (question_text, expected_answer)
         stage3_expected_answers = []  # 用于T4的expected answers
+        # Stage3问题 -> Stage1 rollout key映射 (用于r4计算)
+        stage3_source_keys = []  # 每个stage3问题对应的(p_idx, r_idx)
 
         if self.enable_stage3_paraphrase and passed_perturbations:
             with marked_timer("stage3", timing_raw, color="yellow"):
@@ -464,6 +662,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                     for pert in perts:
                         stage3_questions.append(pert["query"])
                         stage3_expected_answers.append(pert["answer"])
+                        stage3_source_keys.append(key)  # 记录来源rollout
 
                 a_total = len(stage3_questions)
                 logger.info(f"---STAGE3--- 共{a_total}个通过EVS的扰动进入paraphrase")
@@ -476,14 +675,29 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                     )
 
                     stage3_batch = self._generate_for_stage(
-                        stage3_prompt_batch, self.n4, "Stage3", timing_raw
+                        stage3_prompt_batch, self.n4, "Stage3", timing_raw,
+                        use_api=not self.selfplay_stage3,
                     )
 
                     # 解码paraphrase结果, 收集ALL非空paraphrase进入T4
                     stage3_responses = self._decode_responses(stage3_batch)
 
+                    # 打印Stage3模型完整输出
+                    print(f"\n{'='*80}")
+                    print(f"---STAGE3_OUTPUT--- Stage3模型输出 (共{len(stage3_responses)}条)")
+                    print(f"{'='*80}")
+                    for _s3_idx, _s3_resp in enumerate(stage3_responses):
+                        _s3_q_idx = _s3_idx // self.n4
+                        _s3_r_idx = _s3_idx % self.n4
+                        _s3_q_short = stage3_questions[_s3_q_idx][:80].replace('\n', ' ') if _s3_q_idx < len(stage3_questions) else "?"
+                        print(f"---STAGE3_OUTPUT--- [问题{_s3_q_idx}/rollout{_s3_r_idx}] query: {_s3_q_short}")
+                        print(f"---STAGE3_OUTPUT--- [问题{_s3_q_idx}/rollout{_s3_r_idx}] response:\n{_s3_resp}")
+                        print(f"---STAGE3_OUTPUT--- {'─'*60}")
+
                     # stage3_valid_map: t4问题index -> stage3_batch中对应的(q_idx, r_idx)
                     stage3_valid_map = []
+                    # paraphrase_source_keys: 每个paraphrase对应的Stage1 rollout key
+                    paraphrase_source_keys = []
                     for q_idx in range(len(stage3_questions)):
                         for r_idx in range(self.n4):
                             flat_idx = q_idx * self.n4 + r_idx
@@ -493,6 +707,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                                     stage3_expected_answers[q_idx],
                                 ))
                                 stage3_valid_map.append((q_idx, r_idx))
+                                paraphrase_source_keys.append(stage3_source_keys[q_idx])
 
                     b_total = len(paraphrased_questions)
                     logger.info(f"---STAGE3--- Paraphrase完成: {b_total}个有效变体问题 "
@@ -501,6 +716,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                     metrics["selfplay/paraphrase_count"] = b_total
         else:
             stage3_valid_map = []
+            paraphrase_source_keys = []
 
         # ====== Stage 4: 解答paraphrase后的问题 (Stage4) ======
         stage4_batch = None
@@ -518,31 +734,35 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                 )
 
                 stage4_batch = self._generate_for_stage(
-                    stage4_prompt_batch, self.n5, "Stage4", timing_raw
+                    stage4_prompt_batch, self.n5, "Stage4", timing_raw,
+                    use_api=not self.selfplay_stage4,
                 )
 
                 logger.info(f"---STAGE4--- Stage4生成完成")
                 print(f"---STAGE4--- Stage4生成完成")
 
+                # 打印Stage4模型完整输出
+                _s4_responses_tmp = self._decode_responses(stage4_batch)
+                print(f"\n{'='*80}")
+                print(f"---STAGE4_OUTPUT--- Stage4模型输出 (共{len(_s4_responses_tmp)}条)")
+                print(f"{'='*80}")
+                for _s4_idx, _s4_resp in enumerate(_s4_responses_tmp):
+                    _s4_q_idx = _s4_idx // self.n5
+                    _s4_r_idx = _s4_idx % self.n5
+                    _s4_q_text = stage4_questions[_s4_q_idx][:80].replace('\n', ' ') if _s4_q_idx < len(stage4_questions) else "?"
+                    _s4_exp = paraphrased_questions[_s4_q_idx][1] if _s4_q_idx < len(paraphrased_questions) else "?"
+                    print(f"---STAGE4_OUTPUT--- [问题{_s4_q_idx}/rollout{_s4_r_idx}] query: {_s4_q_text}")
+                    print(f"---STAGE4_OUTPUT--- [问题{_s4_q_idx}/rollout{_s4_r_idx}] expected: {_s4_exp}")
+                    print(f"---STAGE4_OUTPUT--- [问题{_s4_q_idx}/rollout{_s4_r_idx}] response:\n{_s4_resp}")
+                    print(f"---STAGE4_OUTPUT--- {'─'*60}")
+                del _s4_responses_tmp
+
         # ====== 计算各阶段reward ======
+        # 顺序: Stage4 → Stage1(依赖Stage4 accuracy) → Stage2 → Stage3
         logger.info("---REWARD--- 开始计算各阶段reward")
         print("---REWARD--- 开始计算各阶段reward")
 
-        # Stage1 reward (per-rollout: 基于EVS结果)
-        if stage1_batch is not None:
-            stage1_rewards = compute_stage1_reward(
-                n_prompts=n_prompts,
-                n1=self.n1,
-                stage1_passed_rollouts=stage1_passed_rollouts,
-                passed_perturbations=passed_perturbations,
-            )
-            seq_len = stage1_batch.batch["attention_mask"].shape[1]
-            stage1_batch.batch["token_level_scores"] = torch.zeros(len(stage1_batch), seq_len)
-            stage1_batch.batch["token_level_scores"][:, -1] = stage1_rewards
-            stage1_batch.batch["token_level_rewards"] = stage1_batch.batch["token_level_scores"].clone()
-            metrics["selfplay/stage1_avg_reward"] = stage1_rewards.mean().item()
-
-        # Stage4 reward (先计算, 因为Stage3 reward依赖Stage4的accuracy)
+        # Stage4 reward (先计算, 因为Stage1和Stage3 reward依赖Stage4的accuracy)
         # Stage4: 全错的group masked out
         stage4_accuracies = []
         if stage4_batch is not None:
@@ -563,7 +783,54 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             stage4_batch.batch["training_mask"] = stage4_training_mask
             metrics["selfplay/stage4_avg_reward"] = stage4_reward_scores.mean().item()
             metrics["selfplay/stage4_avg_accuracy"] = np.mean(stage4_accuracies) if stage4_accuracies else 0.0
-            metrics["selfplay/stage4_masked_out_groups"] = sum(1 for acc in stage4_accuracies if acc == 0.0)
+            metrics["selfplay/stage4_filtered_groups"] = sum(1 for acc in stage4_accuracies if acc == 0.0 or acc == 1.0)
+
+        # Stage1 reward: 部分奖励 (依赖Stage4 accuracy, 所以在Stage4之后计算)
+        if stage1_batch is not None:
+            # 计算每个Stage1 rollout对应的Stage4正确率
+            stage4_acc_per_rollout = {}
+            if stage4_accuracies and paraphrase_source_keys:
+                # stage4_accuracies[j]: 第j个paraphrase的Stage4正确率
+                # paraphrase_source_keys[j]: 第j个paraphrase对应的Stage1 rollout (p_idx, r_idx)
+                # 按rollout key分组收集
+                from collections import defaultdict
+                rollout_accs = defaultdict(list)        # 所有acc
+                rollout_accs_filtered = defaultdict(list)  # 过滤全错组后的acc
+                for j, s1_key in enumerate(paraphrase_source_keys):
+                    if j < len(stage4_accuracies):
+                        acc = stage4_accuracies[j]
+                        rollout_accs[s1_key].append(acc)
+                        if acc > 0.0:  # 过滤全错组 (acc==0)
+                            rollout_accs_filtered[s1_key].append(acc)
+
+                for s1_key in rollout_accs:
+                    acc_all = np.mean(rollout_accs[s1_key])
+                    acc_filt = np.mean(rollout_accs_filtered[s1_key]) if rollout_accs_filtered.get(s1_key) else 0.0
+                    stage4_acc_per_rollout[s1_key] = {
+                        "acc": acc_all,
+                        "acc_filtered": acc_filt,
+                    }
+
+                logger.info(f"---STAGE1_REWARD--- Stage4 acc映射: {len(stage4_acc_per_rollout)} rollouts有Stage4数据")
+
+            stage1_rewards, stage1_training_mask = compute_stage1_reward(
+                n_prompts=n_prompts,
+                n1=self.n1,
+                stage1_va_passed=stage1_va_passed,
+                stage1_ec_passed=stage1_ec_passed,
+                passed_perturbations=passed_perturbations,
+                stage4_acc_per_rollout=stage4_acc_per_rollout,
+                r1_val=self.stage1_r1,
+                r2_val=self.stage1_r2,
+                r3_val=self.stage1_r3,
+                r4_mode=self.stage1_r4_mode,
+            )
+            seq_len = stage1_batch.batch["attention_mask"].shape[1]
+            stage1_batch.batch["token_level_scores"] = torch.zeros(len(stage1_batch), seq_len)
+            stage1_batch.batch["token_level_scores"][:, -1] = stage1_rewards
+            stage1_batch.batch["token_level_rewards"] = stage1_batch.batch["token_level_scores"].clone()
+            stage1_batch.batch["training_mask"] = stage1_training_mask
+            metrics["selfplay/stage1_avg_reward"] = stage1_rewards.mean().item()
 
         # Stage2 reward: 全错的group masked out
         if stage2_batch is not None:
@@ -581,7 +848,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             # 存储training_mask
             stage2_batch.batch["training_mask"] = stage2_training_mask
             metrics["selfplay/stage2_avg_reward"] = stage2_reward_scores.mean().item()
-            metrics["selfplay/stage2_masked_out_groups"] = sum(1 for x in group_has_correct if not x)
+            metrics["selfplay/stage2_filtered_groups"] = int((stage2_training_mask == 0).sum().item()) // self.n3
 
         # Stage3 reward (依赖Stage4 accuracy, 通过stage3_valid_map映射)
         if stage3_batch is not None and stage4_accuracies:
@@ -616,6 +883,9 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
             for i in range(len(stage3_batch)):
                 stage3_batch.batch["token_level_scores"][i, -1] = stage3_reward_scores[i]
             stage3_batch.batch["token_level_rewards"] = stage3_batch.batch["token_level_scores"].clone()
+            # Stage3: 同组rollout共享相同reward (来自同一Stage4 acc), std恒为0
+            # w3=0 已使其不参与训练, 不做dynamic sampling
+            stage3_batch.batch["training_mask"] = torch.ones(len(stage3_batch))
             metrics["selfplay/stage3_avg_reward"] = stage3_reward_scores.mean().item()
 
         # ====== 详细日志: 用于手动验证reward正确性 ======
@@ -762,6 +1032,14 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
 
         logger.info(f"---ADV--- 计算{stage_name}的advantage, batch_size={len(batch)}")
 
+        # pad batch到n_gpus的倍数, 避免dispatch chunk时不同rank tensor shape不一致导致NCCL死锁
+        n_gpus = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        remainder = len(batch) % n_gpus
+        if remainder != 0:
+            pad_size = n_gpus - remainder
+            print(f"---ADV--- Padding {stage_name} batch: {len(batch)} -> {len(batch) + pad_size} (n_gpus={n_gpus})")
+            batch.padding(padding_size=pad_size)
+
         # response_mask
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -781,6 +1059,12 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                 else:
                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                 batch = batch.union(ref_log_prob)
+
+        # 去除padding: compute_log_prob/ref_log_prob需要padding对齐GPU, 但advantage计算不需要
+        if remainder != 0:
+            original_size = len(batch) - pad_size
+            batch = batch.select_idxs(list(range(original_size)))
+            print(f"---ADV--- Trimmed {stage_name} batch back to {len(batch)} (removed {pad_size} padding)")
 
         # compute advantage (GRPO)
         with marked_timer(f"adv_{stage_name}", timing_raw, color="brown"):
@@ -895,6 +1179,23 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         logger.info(f"---UPDATE--- 合并后batch_size={len(combined_batch)}")
         print(f"---UPDATE--- 合并后batch_size={len(combined_batch)}")
 
+        # pad combined_batch使其能被ppo_mini_batch_size和n_gpus整除
+        mini_bs = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        n_gpus = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        # 需要同时被mini_bs和n_gpus整除
+        import math
+        lcm = mini_bs * n_gpus // math.gcd(mini_bs, n_gpus)
+        remainder = len(combined_batch) % lcm
+        if remainder != 0:
+            pad_size = lcm - remainder
+            original_size = len(combined_batch)
+            print(f"---UPDATE--- Padding combined_batch: {original_size} -> {original_size + pad_size} (lcm={lcm})")
+            combined_batch.padding(padding_size=pad_size)
+            # 将padded样本的response_mask和advantages置0, 使其不参与loss计算
+            combined_batch.batch["response_mask"][original_size:] = 0
+            if "advantages" in combined_batch.batch:
+                combined_batch.batch["advantages"][original_size:] = 0
+
         # balance batch (如果配置了)
         if self.config.trainer.balance_batch:
             self._balance_batch(combined_batch, metrics=metrics)
@@ -906,6 +1207,7 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         # update actor
         with marked_timer("update_actor", timing_raw, color="red"):
             combined_batch.meta_info["multi_turn"] = False
+            combined_batch.meta_info["_verl_auto_padding"] = True
             actor_output = self.actor_rollout_wg.update_actor(combined_batch)
         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
         metrics.update(actor_output_metrics)
@@ -915,11 +1217,8 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
 
     def fit(self):
         """
-        主训练循环.
-
-        支持两种模式:
-        1. enable_selfplay=False: 标准GRPO训练 (只用T4)
-        2. enable_selfplay=True: Self-Play 4阶段pipeline
+        主训练循环. Self-Play 4阶段pipeline (DAPO算法).
+        enable_selfplay必须为True, 否则请直接使用verl默认trainer.
         """
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -989,8 +1288,11 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
                             timing_raw=timing_raw,
                         )
                     else:
-                        # ====== 标准GRPO模式 (Stage4-only) ======
-                        self._run_standard_grpo(batch_dict, metrics, timing_raw)
+                        # enable_selfplay=False时不应使用此trainer, 直接报错
+                        raise ValueError(
+                            "enable_selfplay=False: 请直接使用verl默认的RayPPOTrainer或RayDAPOTrainer, "
+                            "无需使用AdaR Self-Play Trainer."
+                        )
 
                 # 验证
                 if (
@@ -1032,98 +1334,3 @@ class RayAdaRSelfPlayTrainer(RayPPOTrainer):
         if hasattr(self, 'executor'):
             self.executor.close()
 
-    def _run_standard_grpo(self, batch_dict: dict, metrics: dict, timing_raw: dict):
-        """
-        标准GRPO训练流程 (等同于原版verl PPO训练, 但使用AdaR的reward函数).
-        当enable_selfplay=False时使用此路径.
-        """
-        batch = DataProto.from_single_dict(batch_dict)
-
-        # 添加uid
-        batch.non_tensor_batch["uid"] = np.array(
-            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-        )
-
-        gen_batch = self._get_gen_batch(batch)
-        gen_batch.meta_info["global_steps"] = self.global_steps
-        n = self.config.actor_rollout_ref.rollout.n
-
-        gen_batch_output = gen_batch.repeat(repeat_times=n, interleave=True)
-
-        # 生成
-        with marked_timer("gen", timing_raw, color="red"):
-            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-            if "timing" in gen_batch_output.meta_info:
-                timing_raw.update(gen_batch_output.meta_info["timing"])
-                gen_batch_output.meta_info.pop("timing", None)
-
-        batch = batch.repeat(repeat_times=n, interleave=True)
-        batch = batch.union(gen_batch_output)
-
-        if "response_mask" not in batch.batch.keys():
-            batch.batch["response_mask"] = compute_response_mask(batch)
-
-        # balance batch
-        if self.config.trainer.balance_batch:
-            self._balance_batch(batch, metrics=metrics)
-
-        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-        # 计算reward
-        with marked_timer("reward", timing_raw, color="yellow"):
-            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-            batch.batch["token_level_scores"] = reward_tensor
-            if reward_extra_infos_dict:
-                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-        # old_log_probs
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-            entropys = old_log_prob.batch.get("entropys")
-            if entropys is not None:
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                metrics["actor/entropy"] = entropy_agg.detach().item()
-                old_log_prob.batch.pop("entropys")
-            batch = batch.union(old_log_prob)
-
-        # reference policy
-        if self.use_reference_policy:
-            with marked_timer("ref", timing_raw, color="olive"):
-                if not self.ref_in_actor:
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                else:
-                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                batch = batch.union(ref_log_prob)
-
-        # compute advantage
-        with marked_timer("adv", timing_raw, color="brown"):
-            norm_adv = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
-            batch = compute_advantage(
-                batch,
-                adv_estimator=self.config.algorithm.adv_estimator,
-                gamma=self.config.algorithm.gamma,
-                lam=self.config.algorithm.lam,
-                num_repeat=n,
-                norm_adv_by_std_in_grpo=norm_adv,
-            )
-
-        # update critic
-        if self.use_critic:
-            with marked_timer("update_critic", timing_raw, color="pink"):
-                critic_output = self.critic_wg.update_critic(batch)
-            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-            metrics.update(critic_output_metrics)
-
-        # update actor
-        if self.config.trainer.critic_warmup <= self.global_steps:
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch.meta_info["multi_turn"] = False
-                actor_output = self.actor_rollout_wg.update_actor(batch)
-            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-            metrics.update(actor_output_metrics)
-
-        # data metrics
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

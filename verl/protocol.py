@@ -881,7 +881,6 @@ class DataProto:
             assert len(self) % chunks == 0, (
                 f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
             )
-
         bsz_in_batch = None
         if self.batch is not None:
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)

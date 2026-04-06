@@ -1,6 +1,6 @@
 # AdaR Self-Play
 
-基于 [verl](https://github.com/volcengine/verl) 框架实现的 Self-Play 版 AdaR 训练系统。让一个小模型（~4B）同时承担数据增强和训练的角色，通过 4 阶段 pipeline 在训练过程中自动合成变体数学题并进行强化学习。
+基于 [verl](https://github.com/volcengine/verl) 框架实现的 Self-Play 版 AdaR 训练系统。让一个小模型（~4B）同时承担数据增强和训练的角色，通过 4 阶段 pipeline 在训练过程中自动合成变体数学题并进行强化学习。使用 DAPO 算法（Token-level PG Loss + 非对称 Clipping + Dynamic Sampling）。
 
 > 详细的设计文档和技术细节见 [doc.md](doc.md)。
 
@@ -29,10 +29,12 @@
 ```
 
 各阶段的 reward 设计：
-- **Stage1**: verify + 扰动 + EVS 全部通过 → 1，否则 → 0
-- **Stage2**: 答案正确 → 1，否则 → 0（全错 group 不参与梯度更新）
-- **Stage3**: `1 - 4*(acc-0.5)^2`，鼓励生成适当难度的改写
-- **Stage4**: 答案正确 → 1，否则 → 0（全错 group 不参与梯度更新）
+- **Stage1**: 部分奖励 — r1(VA通过) + r2(EC通过) + r3(EVS通过) + r4(Stage4正确率)
+- **Stage2**: 答案正确 → 1，否则 → 0
+- **Stage3**: `1 - 4*(acc-0.5)^2`，鼓励生成适当难度的改写（当前 w3=0，暂不参与训练）
+- **Stage4**: 答案正确 → 1，否则 → 0
+
+DAPO Dynamic Sampling：所有阶段过滤 reward std==0 的 group（全对/全错），不参与梯度更新。
 
 ## 目录结构
 
@@ -40,14 +42,15 @@
 verl/
 ├── recipe/adar_selfplay/       # Self-Play recipe（核心代码）
 │   ├── run_adar_selfplay.py    #   训练入口
-│   ├── adar_selfplay_ray_trainer.py  #   4 阶段 trainer
-│   ├── adar_selfplay_reward.py #   reward 计算
+│   ├── adar_selfplay_ray_trainer.py  #   4 阶段 trainer (DAPO)
+│   ├── adar_selfplay_reward.py #   reward 计算 (部分奖励 + dynamic sampling)
 │   ├── auto_pipeline.py        #   代码执行 / 校验 / 扰动 / EVS
+│   ├── api_rollout.py          #   API 异步 rollout 客户端
 │   ├── prompt_builder.py       #   各阶段 prompt 构造
 │   ├── reward_func.py          #   reward 函数注册
 │   ├── test_reward_logic.py    #   reward 单元测试
 │   └── config/
-│       └── adar_selfplay_trainer.yaml  #   Hydra 配置
+│       └── adar_selfplay_trainer.yaml  #   Hydra 配置 (DAPO)
 ├── scripts/adar/               # 训练脚本
 │   ├── prepare_selfplay_data.py      #   数据预处理
 │   └── *.sh                          #   各种训练/测试脚本
@@ -58,6 +61,8 @@ verl/
 ├── ckpt/                       # 训练 checkpoint
 ├── logs/                       # 训练日志
 ├── verl/                       # verl 框架源码
+├── docs/adar/                  # 技术文档
+│   └── dapo_token_level_loss.md  # DAPO loss 实现分析
 └── doc.md                      # 设计文档
 ```
 
@@ -142,17 +147,23 @@ conda run -n lyx-verl python -m recipe.adar_selfplay.run_adar_selfplay \
 
 | 配置 | 效果 |
 |------|------|
-| `adar_selfplay.enable_selfplay=False` | 标准 GRPO，仅 Stage4（baseline） |
-| `adar_selfplay.enable_selfplay=True` | 完整 4 阶段 Self-Play |
+| `adar_selfplay.enable_selfplay=True` | 完整 4 阶段 Self-Play (DAPO) |
 | `adar_selfplay.enable_stage3_paraphrase=False` | 只做 Stage1 + Stage2 |
+| `adar_selfplay.selfplay_stageX=False` | 该阶段用 API rollout 替代本地模型 |
 | `adar_selfplay.debug_inject_stage1=True` | 注入假 Stage1 结果，调试后续阶段 |
+
+> 不需要 self-play 时，请直接使用 verl 默认的 `RayPPOTrainer` 或 `RayDAPOTrainer`。
 
 ### 关键参数
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
 | `n1` / `n2` / `n3` / `n4` / `n5` | 各阶段 rollout / 扰动次数 | 4 / 5 / 8 / 4 / 8 |
-| `w1` / `w2` / `w3` / `w4` | 各阶段 loss 权重 | 0.2 / 0.3 / 0.2 / 0.3 |
+| `w1` / `w2` / `w3` / `w4` | 各阶段 loss 权重 | 0.2 / 0.3 / 0.0 / 0.3 |
+| `stage1_r1` / `r2` / `r3` | Stage1 部分奖励系数 (VA/EC/EVS) | 0.2 / 0.3 / 0.2 |
+| `stage1_r4_mode` | Stage1 r4 计算模式 (1=过滤版, 2=直接版) | 1 |
+| `clip_ratio_low` / `clip_ratio_high` | DAPO 非对称 clipping | 0.2 / 0.28 |
+| `loss_agg_mode` | Loss 聚合模式 (DAPO 用 token-mean) | token-mean |
 | `max_template_code_length` | Stage1 prompt 最大长度 | 2048 |
 | `max_solve_length` | Stage2/4 prompt 最大长度 | 2048 |
 | `perturb_timeout` | 单样本扰动超时（秒） | 30 |
